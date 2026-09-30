@@ -588,13 +588,13 @@ namespace ScreenMonitoringApp
             this.Font = new Font("Segoe UI", 9.0f, FontStyle.Regular);
 
             int windowW = 780;
-            int windowH = 618;
+            int windowH = 672;
             this.ClientSize = new Size(windowW, windowH);
 
             // 1. MODERN ENTEGRE BAŞLIK ÇUBUĞU
             titleBar = new ModernTitleBar(this, "MobiDesk Studio", "BETA");
             titleBar.Location = new Point(0, 0);
-            titleBar.Size = new Size(windowW, 40);
+            titleBar.Size = new Size(windowW, 42);
             this.Controls.Add(titleBar);
 
             // 2. HERO CİHAZ BİLGİ KARTI (DİNAMİK USB ALGILAMA)
@@ -604,8 +604,8 @@ namespace ScreenMonitoringApp
                 "ARANIYOR",
                 MainForm.ColorWarning
             );
-            heroBanner.Location = new Point(18, 48);
-            heroBanner.Size = new Size(windowW - 36, 52);
+            heroBanner.Location = new Point(18, 52);
+            heroBanner.Size = new Size(windowW - 36, 58);
             heroBanner.Cursor = Cursors.Hand;
             heroBanner.Click += delegate(object s, EventArgs e)
             {
@@ -619,8 +619,8 @@ namespace ScreenMonitoringApp
             };
             this.Controls.Add(heroBanner);
 
-            int colY = 108;
-            int colH = 352;
+            int colY = 122;
+            int colH = 404;
             int colW = (windowW - 36 - 16) / 2; // 364 px
 
             // ═══════════════════════════════════════════════
@@ -633,12 +633,12 @@ namespace ScreenMonitoringApp
                 BackColor = ColorBg
             };
 
-            // Sol Kart 1: Çalışma Modu
-            ModernCard cardMode = new ModernCard("ÇALIŞMA MODU (TOPOLOJİ)", 0, 0, colW, 80);
+            // Sol Kart 1: Çalışma Modu (H=86)
+            ModernCard cardMode = new ModernCard("ÇALIŞMA MODU (TOPOLOJİ)", 0, 0, colW, 86);
             modeControl = new ModernSegmentedMode(
                 "🖥️ Genişlet (2. Ekran)",
                 "🔄 Yinele (Ayna)",
-                12, 28, colW - 24, 38
+                12, 30, colW - 24, 42
             );
             modeControl.ModeChanged += delegate(bool isExtend)
             {
@@ -647,15 +647,15 @@ namespace ScreenMonitoringApp
             cardMode.Controls.Add(modeControl);
             pnlLeftCol.Controls.Add(cardMode);
 
-            // Sol Kart 2: Yansıtılacak Monitör Seçimi
-            ModernCard cardScreens = new ModernCard("YANSITILACAK MONİTÖR", 0, 88, colW, 160);
+            // Sol Kart 2: Yansıtılacak Monitör Seçimi (H=186, Y=100)
+            ModernCard cardScreens = new ModernCard("YANSITILACAK MONİTÖR", 0, 100, colW, 186);
             
-            ModernButton btnRefresh = new ModernButton("🔄 Yenile", colW - 86, 7, 74, 20, Color.FromArgb(28, 36, 54), ColorTextMuted, 5);
+            ModernButton btnRefresh = new ModernButton("🔄 Yenile", colW - 86, 7, 74, 22, Color.FromArgb(28, 36, 54), ColorTextMuted, 5);
             btnRefresh.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
             btnRefresh.Click += delegate(object s, EventArgs e) { RefreshScreenList(); };
             cardScreens.Controls.Add(btnRefresh);
 
-            screenSelector = new ModernMonitorSelector(12, 32, colW - 24, 116);
+            screenSelector = new ModernMonitorSelector(12, 34, colW - 24, 140);
             screenSelector.SelectionChanged += delegate(int index, Screen scr, bool isVirt)
             {
                 selectedScreenIndex = index;
@@ -669,8 +669,8 @@ namespace ScreenMonitoringApp
             cardScreens.Controls.Add(screenSelector);
             pnlLeftCol.Controls.Add(cardScreens);
 
-            // Sol Kart 3: Sanal Ekran Sürücüsü (VDD)
-            ModernCard cardVirtual = new ModernCard("SANAL 3. EKRAN YÖNETİMİ (VDD)", 0, 256, colW, 96);
+            // Sol Kart 3: Sanal Ekran Sürücüsü (VDD) (H=104, Y=300)
+            ModernCard cardVirtual = new ModernCard("SANAL 3. EKRAN YÖNETİMİ (VDD)", 0, 300, colW, 104);
 
             lblVddHint = new Label
             {
@@ -684,11 +684,11 @@ namespace ScreenMonitoringApp
             cardVirtual.Controls.Add(lblVddHint);
 
             int btnHalfW = (colW - 24 - 8) / 2;
-            btnAddVirtual = new ModernButton("➕ Sanal Ekran Ayarla", 12, 48, btnHalfW, 36, ColorPrimary, Color.White, 8);
+            btnAddVirtual = new ModernButton("➕ Sanal Ekran Ayarla", 12, 50, btnHalfW, 40, ColorPrimary, Color.White, 8);
             btnAddVirtual.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
             btnAddVirtual.Click += BtnAddVirtual_Click;
 
-            btnRemoveVirtual = new ModernButton("🗑️ Sürücüyü Kaldır", 12 + btnHalfW + 8, 48, btnHalfW, 36, Color.FromArgb(32, 24, 32), Color.FromArgb(244, 114, 182), 8, Color.FromArgb(70, 30, 50));
+            btnRemoveVirtual = new ModernButton("🗑️ Sürücüyü Kaldır", 12 + btnHalfW + 8, 50, btnHalfW, 40, Color.FromArgb(32, 24, 32), Color.FromArgb(244, 114, 182), 8, Color.FromArgb(70, 30, 50));
             btnRemoveVirtual.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
             btnRemoveVirtual.Click += BtnRemoveVirtual_Click;
 
@@ -708,8 +708,8 @@ namespace ScreenMonitoringApp
                 BackColor = ColorBg
             };
 
-            // Sağ Kart 1: Performans & Hız (H=172)
-            ModernCard cardPerf = new ModernCard("AKIŞ VE HIZ LİMİTİ", 0, 0, colW, 172);
+            // Sağ Kart 1: Performans & Hız (H=192, Y=0)
+            ModernCard cardPerf = new ModernCard("AKIŞ VE HIZ LİMİTİ", 0, 0, colW, 192);
 
             // FPS Satırı
             Label lblFpsTitle = new Label
@@ -718,7 +718,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 ForeColor = ColorTextMuted,
                 BackColor = ColorCard,
-                Location = new Point(12, 24),
+                Location = new Point(12, 26),
                 AutoSize = true
             };
             lblFpsVal = new Label
@@ -727,7 +727,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
                 ForeColor = ColorSuccess,
                 BackColor = ColorCard,
-                Location = new Point(colW - 90, 23),
+                Location = new Point(colW - 90, 25),
                 Size = new Size(78, 18),
                 TextAlign = ContentAlignment.MiddleRight
             };
@@ -736,8 +736,8 @@ namespace ScreenMonitoringApp
 
             tbFps = new ModernSlider(15, 75, 60, ColorSuccess, Color.FromArgb(6, 182, 212))
             {
-                Location = new Point(12, 44),
-                Size = new Size(colW - 24, 18)
+                Location = new Point(12, 48),
+                Size = new Size(colW - 24, 20)
             };
             tbFps.ValueChanged += delegate(object s, EventArgs e) { UpdateFps(tbFps.Value); };
             cardPerf.Controls.Add(tbFps);
@@ -748,7 +748,7 @@ namespace ScreenMonitoringApp
             for (int i = 0; i < fpsPresets.Length; i++)
             {
                 int val = fpsPresets[i];
-                QuickChip chip = new QuickChip(val.ToString() + " FPS", 12 + i * (chipW + 3), 66, chipW, 18);
+                QuickChip chip = new QuickChip(val.ToString() + " FPS", 12 + i * (chipW + 3), 74, chipW, 22);
                 chip.Click += delegate(object s, EventArgs e) { tbFps.Value = val; };
                 cardPerf.Controls.Add(chip);
             }
@@ -760,7 +760,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 ForeColor = ColorTextMuted,
                 BackColor = ColorCard,
-                Location = new Point(12, 92),
+                Location = new Point(12, 108),
                 AutoSize = true
             };
             lblQualityVal = new Label
@@ -769,7 +769,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 ForeColor = ColorAccent,
                 BackColor = ColorCard,
-                Location = new Point(colW - 120, 91),
+                Location = new Point(colW - 120, 107),
                 Size = new Size(108, 18),
                 TextAlign = ContentAlignment.MiddleRight
             };
@@ -778,8 +778,8 @@ namespace ScreenMonitoringApp
 
             tbQuality = new ModernSlider(15, 100, 65, ColorPrimary, Color.FromArgb(168, 85, 247))
             {
-                Location = new Point(12, 112),
-                Size = new Size(colW - 24, 18)
+                Location = new Point(12, 130),
+                Size = new Size(colW - 24, 20)
             };
             tbQuality.ValueChanged += delegate(object s, EventArgs e) { UpdateQuality(tbQuality.Value); };
             cardPerf.Controls.Add(tbQuality);
@@ -790,20 +790,20 @@ namespace ScreenMonitoringApp
             for (int i = 0; i < qPresets.Length; i++)
             {
                 int val = qPresets[i];
-                QuickChip chip = new QuickChip(qLabels[i], 12 + i * (chipW + 3), 134, chipW, 18);
+                QuickChip chip = new QuickChip(qLabels[i], 12 + i * (chipW + 3), 156, chipW, 22);
                 chip.Click += delegate(object s, EventArgs e) { tbQuality.Value = val; };
                 cardPerf.Controls.Add(chip);
             }
 
             pnlRightCol.Controls.Add(cardPerf);
 
-            // Sağ Kart 2: Sistem ve Motor Seçenekleri (H=172, Y=180)
-            ModernCard cardOpts = new ModernCard("SİSTEM VE OPTİMİZASYONLAR", 0, 180, colW, 172);
+            // Sağ Kart 2: Sistem ve Motor Seçenekleri (H=198, Y=206)
+            ModernCard cardOpts = new ModernCard("SİSTEM VE OPTİMİZASYONLAR", 0, 206, colW, 198);
 
             swAdaptiveFps = new ModernSwitch(
                 "⚡ Akıllı 60 FPS Performans Modu",
                 "Yüksek pikselli cihazları 60 FPS'e dengeler (Kapalıyken 1:1)",
-                12, 26, colW - 24, 42
+                12, 28, colW - 24, 48
             );
             swAdaptiveFps.Checked = true;
             swAdaptiveFps.CheckedChanged += delegate(object s, EventArgs e)
@@ -816,7 +816,7 @@ namespace ScreenMonitoringApp
             swShowFps = new ModernSwitch(
                 "Cihazda Canlı FPS Sayacı Göster",
                 "Sol üst köşede yeşil donanım OSD sayacı gösterir",
-                12, 72, colW - 24, 42
+                12, 82, colW - 24, 48
             );
             swShowFps.Checked = true;
             swShowFps.CheckedChanged += delegate(object s, EventArgs e)
@@ -829,7 +829,7 @@ namespace ScreenMonitoringApp
             swBatterySaver = new ModernSwitch(
                 "Akıllı Güç ve Veri Tasarrufu",
                 "Statik ekranda gereksiz veri aktarımını durdurur",
-                12, 118, colW - 24, 42
+                12, 136, colW - 24, 48
             );
             swBatterySaver.Checked = false;
             swBatterySaver.CheckedChanged += delegate(object s, EventArgs e)
@@ -845,12 +845,12 @@ namespace ScreenMonitoringApp
             // ═══════════════════════════════════════════════
             // ALT KOMUTA VE CANLI TELEMETRİ GÜVERTESİ
             // ═══════════════════════════════════════════════
-            int bottomY = colY + colH + 12; // 472
+            int bottomY = colY + colH + 14; // 540
 
             // Büyük Aksiyon Butonu
             btnStartStop = new ModernButton(
                 "▶    EKRAN PAYLAŞIMINI BAŞLAT",
-                18, bottomY, windowW - 36, 48,
+                18, bottomY, windowW - 36, 50,
                 ColorSuccess, Color.FromArgb(11, 15, 25), 10
             );
             btnStartStop.Font = new Font("Segoe UI", 11.5f, FontStyle.Bold);
@@ -858,8 +858,8 @@ namespace ScreenMonitoringApp
             this.Controls.Add(btnStartStop);
 
             // Canlı Telemetri Çubuğu
-            RoundedPanel pnlBottomBar = new RoundedPanel(windowW - 36, 48, 10, ColorCard, ColorCardBorder);
-            pnlBottomBar.Location = new Point(18, bottomY + 54);
+            RoundedPanel pnlBottomBar = new RoundedPanel(windowW - 36, 50, 10, ColorCard, ColorCardBorder);
+            pnlBottomBar.Location = new Point(18, bottomY + 56);
 
             lblStatusDot = new Label
             {
@@ -867,7 +867,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 12f, FontStyle.Bold),
                 ForeColor = ColorSuccess,
                 BackColor = ColorCard,
-                Location = new Point(12, 6),
+                Location = new Point(12, 7),
                 AutoSize = true
             };
             pnlBottomBar.Controls.Add(lblStatusDot);
@@ -878,7 +878,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
                 ForeColor = ColorText,
                 BackColor = ColorCard,
-                Location = new Point(32, 7),
+                Location = new Point(32, 8),
                 AutoSize = true
             };
             pnlBottomBar.Controls.Add(lblStatusTitle);
@@ -889,16 +889,16 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 7.5f),
                 ForeColor = ColorTextMuted,
                 BackColor = ColorCard,
-                Location = new Point(33, 26),
+                Location = new Point(33, 28),
                 Size = new Size(330, 16)
             };
             pnlBottomBar.Controls.Add(lblStatusSub);
 
             // Sağ Telemetri Rozetleri
-            badgeLatency = new TelemetryBadge("⏱ Gecikme", "<1 ms", (windowW - 36) - 86, 10, 74, 28);
-            badgeSize = new TelemetryBadge("📦 Boyut", "0 KB", (windowW - 36) - 176, 10, 82, 28);
-            badgeBandwidth = new TelemetryBadge("📶 Veri", "0.0 MB/s", (windowW - 36) - 276, 10, 92, 28);
-            badgeFps = new TelemetryBadge("⚡ FPS", "0", (windowW - 36) - 356, 10, 72, 28);
+            badgeLatency = new TelemetryBadge("⏱ Gecikme", "<1 ms", (windowW - 36) - 86, 11, 74, 28);
+            badgeSize = new TelemetryBadge("📦 Boyut", "0 KB", (windowW - 36) - 176, 11, 82, 28);
+            badgeBandwidth = new TelemetryBadge("📶 Veri", "0.0 MB/s", (windowW - 36) - 276, 11, 92, 28);
+            badgeFps = new TelemetryBadge("⚡ FPS", "0", (windowW - 36) - 356, 11, 72, 28);
 
             pnlBottomBar.Controls.Add(badgeLatency);
             pnlBottomBar.Controls.Add(badgeSize);
@@ -2193,8 +2193,9 @@ namespace ScreenMonitoringApp
             base.OnResize(eventargs);
             if (btnClose != null && btnMin != null)
             {
-                btnClose.Location = new Point(this.Width - 44, 4);
-                btnMin.Location = new Point(this.Width - 88, 4);
+                int btnY = (this.Height - 32) / 2;
+                btnClose.Location = new Point(this.Width - 44, btnY);
+                btnMin.Location = new Point(this.Width - 88, btnY);
             }
         }
 
@@ -2216,7 +2217,8 @@ namespace ScreenMonitoringApp
             }
 
             // App Icon
-            Rectangle iconBox = new Rectangle(14, 8, 24, 24);
+            int iconY = (this.Height - 24) / 2;
+            Rectangle iconBox = new Rectangle(14, iconY, 24, 24);
             Image logo = MainForm.GetAppLogoImage();
             if (logo != null)
             {
@@ -2256,7 +2258,8 @@ namespace ScreenMonitoringApp
             using (Font titleFont = new Font("Segoe UI", 9.5f, FontStyle.Bold))
             using (SolidBrush b = new SolidBrush(MainForm.ColorText))
             {
-                g.DrawString(appTitle, titleFont, b, 44, 11);
+                int titleY = (this.Height - 18) / 2;
+                g.DrawString(appTitle, titleFont, b, 44, titleY);
             }
 
             // Sürüm Rozeti (BETA)
@@ -2265,7 +2268,8 @@ namespace ScreenMonitoringApp
             {
                 int badgeX = 44 + (int)g.MeasureString(appTitle, titleFont).Width + 8;
                 int badgeW = Math.Max(42, (int)g.MeasureString(appBadge, bFont).Width + 14);
-                Rectangle badgeRect = new Rectangle(badgeX, 12, badgeW, 16);
+                int badgeY = (this.Height - 16) / 2;
+                Rectangle badgeRect = new Rectangle(badgeX, badgeY, badgeW, 16);
                 using (GraphicsPath bp = RoundedPanel.CreateRoundedRect(badgeRect, 4))
                 {
                     using (SolidBrush bgB = new SolidBrush(Color.FromArgb(28, 36, 56)))
@@ -2436,7 +2440,8 @@ namespace ScreenMonitoringApp
             // Sol Vektör Cihaz Çizimi (Telefon veya Tablet)
             if (isPortrait)
             {
-                Rectangle phoneRect = new Rectangle(17, 9, 18, 34);
+                int phY = (this.Height - 34) / 2;
+                Rectangle phoneRect = new Rectangle(16, phY, 18, 34);
                 using (GraphicsPath pp = RoundedPanel.CreateRoundedRect(phoneRect, 4))
                 {
                     using (Pen pPhone = new Pen(MainForm.ColorAccent, 1.5f))
@@ -2446,17 +2451,18 @@ namespace ScreenMonitoringApp
                 }
                 using (SolidBrush bSc = new SolidBrush(Color.FromArgb(30, 40, 60)))
                 {
-                    g.FillRectangle(bSc, 20, 13, 12, 23);
+                    g.FillRectangle(bSc, 19, phY + 4, 12, 23);
                 }
                 using (SolidBrush bDot = new SolidBrush(MainForm.ColorAccent))
                 {
-                    g.FillRectangle(bDot, 23, 10, 6, 2);
-                    g.FillRectangle(bDot, 23, 38, 6, 2);
+                    g.FillRectangle(bDot, 22, phY + 1, 6, 2);
+                    g.FillRectangle(bDot, 22, phY + 29, 6, 2);
                 }
             }
             else
             {
-                Rectangle tabRect = new Rectangle(12, 12, 28, 26);
+                int tabY = (this.Height - 28) / 2;
+                Rectangle tabRect = new Rectangle(14, tabY, 30, 28);
                 using (GraphicsPath tp = RoundedPanel.CreateRoundedRect(tabRect, 4))
                 {
                     using (Pen pTab = new Pen(MainForm.ColorAccent, 1.5f))
@@ -2466,26 +2472,26 @@ namespace ScreenMonitoringApp
                 }
                 using (SolidBrush bSc = new SolidBrush(Color.FromArgb(30, 40, 60)))
                 {
-                    g.FillRectangle(bSc, 15, 15, 18, 20);
+                    g.FillRectangle(bSc, 17, tabY + 3, 20, 22);
                 }
                 using (SolidBrush bDot = new SolidBrush(MainForm.ColorAccent))
                 {
-                    g.FillEllipse(bDot, 35, 23, 3, 3);
+                    g.FillEllipse(bDot, 39, tabY + 12, 3, 3);
                 }
             }
 
             // Cihaz Adı
-            using (Font titleFont = new Font("Segoe UI", 9.5f, FontStyle.Bold))
+            using (Font titleFont = new Font("Segoe UI", 10.0f, FontStyle.Bold))
             using (SolidBrush bTitle = new SolidBrush(MainForm.ColorText))
             {
-                g.DrawString(deviceName, titleFont, bTitle, 46, 8);
+                g.DrawString(deviceName, titleFont, bTitle, 54, 10);
             }
 
             // Özellikler ve Bağlantı Alt Metni
-            using (Font subFont = new Font("Segoe UI", 8.0f))
+            using (Font subFont = new Font("Segoe UI", 8.2f))
             using (SolidBrush bSub = new SolidBrush(MainForm.ColorTextMuted))
             {
-                g.DrawString(specs, subFont, bSub, 46, 28);
+                g.DrawString(specs, subFont, bSub, 54, 32);
             }
 
             // Sağ Durum Rozeti (Pill)
@@ -2794,8 +2800,8 @@ namespace ScreenMonitoringApp
             this.Controls.Clear();
             this.AutoScroll = (monitors.Count > 3);
             int curY = 0;
-            int cardH = (monitors.Count >= 3) ? 36 : 50;
-            int gap = (monitors.Count >= 3) ? 3 : 6;
+            int cardH = (monitors.Count >= 3) ? 40 : 52;
+            int gap = (monitors.Count >= 3) ? 5 : 8;
             int itemW = (monitors.Count > 3) ? (this.Width - 18) : this.Width;
 
             Control selectedCtrl = null;
