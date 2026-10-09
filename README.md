@@ -17,6 +17,7 @@ MobiDesk provides a high-performance screen mirroring and virtual display extens
 * **👆 Bidirectional Touch Support:** Touch events on your tablet are instantly forwarded over TCP back to the PC, acting as native mouse clicks, touches, and drag-and-drop gestures.
 * **📱 Automatic Device & DPI Detection:** Automatically queries ADB for device model name, resolution, and DPI to dynamically tune stream parameters.
 * **🎨 Modern Dark Studio Dashboard:** Built with a custom dark UI featuring real-time telemetry (FPS counter, bandwidth in MB/s, frame size in KB, and transmission latency).
+* **🌐 Instant Language Switcher (TR / EN):** Seamlessly switch between Turkish and English in real time with an integrated toggle in the title bar. Persists your choice across sessions.
 * **🔌 Zero-Config ADB Automation:** Automated reverse port tunneling (`tcp:55555`) and client app auto-launch handled automatically by the PC studio.
 
 ---
@@ -24,6 +25,9 @@ MobiDesk provides a high-performance screen mirroring and virtual display extens
 ## 📖 MobiDesk Studio Interface Guide
 
 The MobiDesk Studio interface consolidates all display, performance, and driver settings into a single, intuitive control panel:
+
+### 0. Language Switcher (Top-Right Title Bar)
+* Easily toggle between **Turkish (`TR`)** and **English (`EN`)** on the fly. All titles, telemetry badges, and controls update dynamically with zero restart required.
 
 ### 1. Connected Device Info Card (Top Banner)
 * Dynamically detects connected USB devices, displays native resolution (e.g., `1280x800`), screen DPI, and connection status.

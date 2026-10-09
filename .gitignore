@@ -24,6 +24,8 @@ Thumbs.db
 *.tmp
 *.bak
 *.swp
+*.cfg
+mobidesk.cfg
 
 # Visual Studio / C# build artifacts (if opened in VS)
 bin/

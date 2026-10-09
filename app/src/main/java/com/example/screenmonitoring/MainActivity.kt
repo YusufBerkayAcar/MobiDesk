@@ -22,6 +22,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var serverSocket: ServerSocket? = null
 
     private var outputStream: OutputStream? = null
+    private var activeSocket: Socket? = null
     private val socketLock = Any()
 
     private var surfaceWidth = 1280
@@ -45,6 +46,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         setContentView(surfaceView)
 
         setupTouchEvents()
+    }
+
+    override fun onBackPressed() {
+        // Geri tuşuna basıldığında uygulamayı kapatmak yerine arka plana al
+        moveTaskToBack(true)
     }
 
     override fun onResume() {
@@ -135,6 +141,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         isRunning.set(false)
         synchronized(socketLock) {
             outputStream = null
+            try { activeSocket?.close() } catch (_: Exception) {}
+            activeSocket = null
         }
         try {
             serverSocket?.close()
@@ -172,7 +180,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         override fun run() {
             try {
-                serverSocket = ServerSocket(55555)
+                val server = ServerSocket()
+                server.reuseAddress = true
+                server.bind(java.net.InetSocketAddress(55555))
+                serverSocket = server
             } catch (e: Exception) {
                 drawStatusMessage("Soket Başlatılamadı", "Port 55555 kullanılamıyor: ${e.message}")
                 return
@@ -191,9 +202,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
                     socket = serverSocket!!.accept()
                     socket.tcpNoDelay = true
-                    socket.receiveBufferSize = 1024 * 1024
+                    socket.receiveBufferSize = 64 * 1024
 
                     synchronized(socketLock) {
+                        activeSocket = socket
                         outputStream = socket.getOutputStream()
                     }
 
@@ -214,16 +226,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
                     // Aşama A & D: Çok Çekirdekli Paralel Decode ve Triple/Quad Buffering Donanım Hattı
                     val NUM_DECODERS = 2
-                    val rawFrameQueue = java.util.concurrent.ArrayBlockingQueue<FrameData>(8)
-                    val freePool = java.util.concurrent.ArrayBlockingQueue<FrameData>(12).apply {
-                        for (i in 0..11) offer(FrameData(0L, ByteArray(512 * 1024), 0))
+                    val rawFrameQueue = java.util.concurrent.ArrayBlockingQueue<FrameData>(2)
+                    val freePool = java.util.concurrent.ArrayBlockingQueue<FrameData>(6).apply {
+                        for (i in 0..5) offer(FrameData(0L, ByteArray(512 * 1024), 0))
                     }
 
                     val targetW = if (surfaceWidth > 0) surfaceWidth else 1280
                     val targetH = if (surfaceHeight > 0) surfaceHeight else 800
 
-                    val bitmapList = Array(8) { Bitmap.createBitmap(targetW, targetH, Bitmap.Config.RGB_565) }
-                    val freeBitmapQueue = java.util.concurrent.ArrayBlockingQueue<Bitmap>(8).apply {
+                    val bitmapList = Array(4) { Bitmap.createBitmap(targetW, targetH, Bitmap.Config.RGB_565) }
+                    val freeBitmapQueue = java.util.concurrent.ArrayBlockingQueue<Bitmap>(4).apply {
                         for (b in bitmapList) offer(b)
                     }
 
@@ -346,12 +358,40 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                                 if (pendingFrames.containsKey(nextExpectedSeq)) {
                                     readyBmp = pendingFrames.remove(nextExpectedSeq)
                                     nextExpectedSeq++
+
+                                    // SIFIR GECİKME (ZERO-LAG): Eğer arkada birikmiş başka kareler varsa, eski olanları atla ve doğrudan en güncel kareye yetiş!
+                                    if (pendingFrames.size > 1) {
+                                        val latestKey = pendingFrames.lastKey()
+                                        val it = pendingFrames.entries.iterator()
+                                        while (it.hasNext()) {
+                                            val entry = it.next()
+                                            if (entry.key != latestKey) {
+                                                freeBitmapQueue.offer(entry.value)
+                                                dropOrderCounter.incrementAndGet()
+                                                it.remove()
+                                            }
+                                        }
+                                        val latestBmp = pendingFrames.remove(latestKey)
+                                        if (latestBmp != null) {
+                                            freeBitmapQueue.offer(readyBmp)
+                                            readyBmp = latestBmp
+                                            nextExpectedSeq = latestKey + 1
+                                        }
+                                    }
                                 } else if (pendingFrames.isNotEmpty()) {
-                                    // 15ms zaman aşımı: Beklenen kare gecikti/düştü, en yakın mevcut kareye atla
-                                    val firstEntry = pendingFrames.firstEntry()
-                                    if (firstEntry != null) {
-                                        readyBmp = pendingFrames.remove(firstEntry.key)
-                                        nextExpectedSeq = firstEntry.key + 1
+                                    // 15ms zaman aşımı: Beklenen kare gecikti/düştü, en güncel (en son) kareye doğrudan atla!
+                                    val lastEntry = pendingFrames.lastEntry()
+                                    if (lastEntry != null) {
+                                        val latestKey = lastEntry.key
+                                        val latestBmp = lastEntry.value
+                                        for ((seq, bmp) in pendingFrames) {
+                                            if (seq != latestKey) {
+                                                freeBitmapQueue.offer(bmp)
+                                            }
+                                        }
+                                        pendingFrames.clear()
+                                        readyBmp = latestBmp
+                                        nextExpectedSeq = latestKey + 1
                                         dropOrderCounter.incrementAndGet()
                                     }
                                 }
@@ -478,6 +518,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 } finally {
                     synchronized(socketLock) {
                         outputStream = null
+                        activeSocket = null
                     }
                     try {
                         socket?.close()
