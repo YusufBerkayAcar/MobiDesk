@@ -34,6 +34,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var currentFps = 0
     @Volatile private var showFpsCounter = true
     private var lastTapTime = 0L
+    private var mobiHubOverlay: MobiHubOverlay? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -41,17 +42,50 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         // Ekranın kapanmasını engelle
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // MobiFlow sunucusunu başlat
+        MobiFlowServer.instance.init(this)
+        MobiFlowServer.instance.start()
+
+        val rootLayout = android.widget.FrameLayout(this)
         surfaceView = SurfaceView(this)
         surfaceView.holder.setFormat(PixelFormat.RGBA_8888)
         surfaceView.holder.addCallback(this)
-        setContentView(surfaceView)
+
+        rootLayout.addView(
+            surfaceView,
+            android.widget.FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+
+        // Modern Hub (Flow & Bildirimler Çekmecesi) katmanını ekle
+        mobiHubOverlay = MobiHubOverlay(this, rootLayout)
+        setContentView(rootLayout)
 
         setupTouchEvents()
     }
 
     override fun onBackPressed() {
+        if (mobiHubOverlay?.handleBackPressed() == true) {
+            return
+        }
         // Geri tuşuna basıldığında uygulamayı kapatmak yerine arka plana al
         moveTaskToBack(true)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == 1001 && resultCode == Activity.RESULT_OK) {
+            data?.data?.let { uri ->
+                mobiHubOverlay?.handleFilePickedUri(uri)
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        MobiFlowServer.instance.stop()
     }
 
     override fun onResume() {
@@ -221,6 +255,36 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         private val sbVectorPaint = Paint(Paint.ANTI_ALIAS_FLAG)
         private val sbRectF = RectF()
         private val sbRectF2 = RectF()
+        private var cachedLogoBitmap: Bitmap? = null
+        private var cachedLogoSize: Int = 0
+
+        private fun getOrCreateLogoBitmap(targetPx: Int, radiusPx: Float): Bitmap? {
+            if (cachedLogoBitmap != null && cachedLogoSize == targetPx && !cachedLogoBitmap!!.isRecycled) {
+                return cachedLogoBitmap
+            }
+            try {
+                val rawBmp = BitmapFactory.decodeResource(resources, R.drawable.app_logo) ?: return null
+                val scaledBmp = Bitmap.createScaledBitmap(rawBmp, targetPx, targetPx, true)
+                if (scaledBmp != rawBmp) {
+                    rawBmp.recycle()
+                }
+
+                val rounded = Bitmap.createBitmap(targetPx, targetPx, Bitmap.Config.ARGB_8888)
+                val c = Canvas(rounded)
+                val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                val r = RectF(0f, 0f, targetPx.toFloat(), targetPx.toFloat())
+                c.drawRoundRect(r, radiusPx, radiusPx, p)
+                p.xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+                c.drawBitmap(scaledBmp, 0f, 0f, p)
+                scaledBmp.recycle()
+
+                cachedLogoBitmap = rounded
+                cachedLogoSize = targetPx
+                return rounded
+            } catch (_: Exception) {
+                return null
+            }
+        }
 
         fun stopStandby() {
             stopStandbyAnimation()
@@ -755,41 +819,20 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
 
             // 4. Üst Bar (Header Bar)
-            // A) Logo Rozeti (Gelişmiş Vektör İkon Kutusu)
+            // A) Logo Rozeti (Özel Uygulama Logosu)
             sbRectF.set(padX, padY, padX + logoSize, padY + logoSize)
 
-            sbCardBgPaint.color = Color.rgb(17, 26, 44)
-            canvas.drawRoundRect(sbRectF, 10f * dp, 10f * dp, sbCardBgPaint)
+            val logoBmp = getOrCreateLogoBitmap(logoSize.toInt().coerceAtLeast(1), 10f * dp)
+            if (logoBmp != null && !logoBmp.isRecycled) {
+                canvas.drawBitmap(logoBmp, padX, padY, null)
+            } else {
+                sbCardBgPaint.color = Color.rgb(17, 26, 44)
+                canvas.drawRoundRect(sbRectF, 10f * dp, 10f * dp, sbCardBgPaint)
+            }
 
-            sbCardBorderPaint.color = Color.rgb(14, 165, 233)
+            sbCardBorderPaint.color = Color.argb(160, 14, 165, 233)
             sbCardBorderPaint.strokeWidth = 1.6f * dp
             canvas.drawRoundRect(sbRectF, 10f * dp, 10f * dp, sbCardBorderPaint)
-
-            // Vektör Çift Monitör İkonu (Kutu içinde tam ortalanmış)
-            val lBoxCx = padX + logoSize / 2f
-            val lBoxCy = padY + logoSize / 2f
-
-            sbVectorPaint.color = Color.rgb(56, 189, 248)
-            sbVectorPaint.style = Paint.Style.STROKE
-            sbVectorPaint.strokeWidth = 1.8f * dp
-
-            val monW = 16f * dp
-            val monH = 12f * dp
-            val monL = lBoxCx - monW / 2f - 3f * dp
-            val monT = lBoxCy - monH / 2f - 2f * dp
-            sbRectF2.set(monL, monT, monL + monW, monT + monH)
-            canvas.drawRoundRect(sbRectF2, 2.5f * dp, 2.5f * dp, sbVectorPaint)
-
-            sbVectorPaint.color = Color.rgb(99, 102, 241)
-            val mon2L = monL + 8f * dp
-            val mon2T = monT + 3f * dp
-            sbRectF2.set(mon2L, mon2T, mon2L + 14f * dp, mon2T + 12f * dp)
-            canvas.drawRoundRect(sbRectF2, 2f * dp, 2f * dp, sbVectorPaint)
-
-            sbVectorPaint.color = Color.rgb(148, 163, 184)
-            sbVectorPaint.strokeWidth = 1.4f * dp
-            canvas.drawLine(monL + 8f * dp, monT + monH, monL + 8f * dp, monT + monH + 4f * dp, sbVectorPaint)
-            canvas.drawLine(monL + 4f * dp, monT + monH + 4f * dp, monL + 12f * dp, monT + monH + 4f * dp, sbVectorPaint)
 
             // B) Marka Başlığı (Beta etiketiyle)
             val titleX = padX + logoSize + 12f * dp
@@ -803,9 +846,26 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             canvas.drawText("STUDIO ", titleX + mobiW, padY + 20f * dp, sbTextBold)
 
             val studioW = sbTextBold.measureText("STUDIO ")
-            sbTextBold.textSize = 11.5f * sp
-            sbTextBold.color = Color.rgb(244, 114, 182) // Şık pembe/mor Beta rozeti
-            canvas.drawText("(Beta)", titleX + mobiW + studioW, padY + 18.5f * dp, sbTextBold)
+
+            // Mikro Rozet (Warm Amber Beta Badge)
+            val betaText = "BETA"
+            sbTextBold.textSize = 9f * sp
+            val betaW = sbTextBold.measureText(betaText)
+            val betaBadgeW = betaW + 10f * dp
+            val betaBadgeH = 16f * dp
+            val betaBadgeX = titleX + mobiW + studioW + 2f * dp
+            val betaBadgeY = padY + 7.5f * dp
+
+            sbRectF2.set(betaBadgeX, betaBadgeY, betaBadgeX + betaBadgeW, betaBadgeY + betaBadgeH)
+            sbBadgeBgPaint.color = Color.argb(45, 245, 158, 11)
+            canvas.drawRoundRect(sbRectF2, 4f * dp, 4f * dp, sbBadgeBgPaint)
+
+            sbBadgeBorderPaint.color = Color.argb(120, 245, 158, 11)
+            sbBadgeBorderPaint.strokeWidth = 1f * dp
+            canvas.drawRoundRect(sbRectF2, 4f * dp, 4f * dp, sbBadgeBorderPaint)
+
+            sbTextBold.color = Color.rgb(251, 191, 36)
+            canvas.drawText(betaText, betaBadgeX + 5f * dp, betaBadgeY + 11.5f * dp, sbTextBold)
 
             sbTextRegular.textSize = 10.5f * sp
             sbTextRegular.color = Color.rgb(148, 163, 184)

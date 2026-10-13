@@ -29,6 +29,11 @@ namespace ScreenMonitoringApp
         [DllImport("user32.dll")]
         private static extern bool PostMessage(IntPtr hWnd, int Msg, IntPtr wParam, IntPtr lParam);
 
+        [DllImport("user32.dll")]
+        private static extern bool AllowSetForegroundWindow(int dwProcessId);
+
+        private const int ASFW_ANY = -1;
+
         private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
 
         private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
@@ -121,6 +126,7 @@ namespace ScreenMonitoringApp
                 bool autoStart = false;
                 string snapshotPath = null;
                 bool closeAfterSnapshot = false;
+                int initialTab = 0;
                 if (args != null)
                 {
                     for (int i = 0; i < args.Length; i++)
@@ -128,6 +134,7 @@ namespace ScreenMonitoringApp
                         if (string.Equals(args[i], "--autostart", StringComparison.OrdinalIgnoreCase)) autoStart = true;
                         if (string.Equals(args[i], "--snapshot", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) snapshotPath = args[i + 1];
                         if (string.Equals(args[i], "--closeAfterSnapshot", StringComparison.OrdinalIgnoreCase)) closeAfterSnapshot = true;
+                        if (string.Equals(args[i], "--tab", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out initialTab);
                         if (string.Equals(args[i], "--device", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) MainForm.activeTargetSerial = args[i + 1];
                     }
                 }
@@ -169,7 +176,8 @@ namespace ScreenMonitoringApp
 
                     if (!createdNewMutex)
                     {
-                        Log("MobiDesk is already running. Signaling existing instance to restore window and exiting second instance.");
+                        Log("MobiDesk is already running. Signaling existing instance to restore window...");
+                        try { AllowSetForegroundWindow(ASFW_ANY); } catch { }
                         try
                         {
                             using (EventWaitHandle existingEvent = EventWaitHandle.OpenExisting(EVENT_NAME))
@@ -192,7 +200,41 @@ namespace ScreenMonitoringApp
                         }
                         catch { }
 
-                        return;
+                        // Mevcut MobiDesk işlemini denetle (Pencerenin açılması için 350ms bekle)
+                        Thread.Sleep(350);
+                        Process cur = Process.GetCurrentProcess();
+                        Process[] others = Process.GetProcessesByName("MobiDesk");
+                        bool activeFound = false;
+
+                        foreach (Process p in others)
+                        {
+                            if (p.Id != cur.Id)
+                            {
+                                try
+                                {
+                                    p.Refresh();
+                                    if (p.Responding && p.MainWindowHandle != IntPtr.Zero)
+                                    {
+                                        activeFound = true;
+                                        Log("Active instance with window (PID " + p.Id + ") restored.");
+                                    }
+                                    else
+                                    {
+                                        Log("Existing MobiDesk process (PID " + p.Id + ") has no visible window or is unresponsive. Terminating zombie process.");
+                                        try { p.Kill(); p.WaitForExit(1000); } catch { }
+                                    }
+                                }
+                                catch { }
+                            }
+                        }
+
+                        if (activeFound)
+                        {
+                            Log("Active instance signaled. Exiting second instance.");
+                            return;
+                        }
+
+                        Log("No active responsive instance with visible window found. Proceeding to launch new instance.");
                     }
 
                     try
@@ -208,8 +250,8 @@ namespace ScreenMonitoringApp
 
                 try
                 {
-                    Log("Starting MainForm autoStart=" + autoStart + ", snapshot=" + (snapshotPath ?? "none"));
-                    Application.Run(new MainForm(autoStart, snapshotPath, closeAfterSnapshot));
+                    Log("Starting MainForm autoStart=" + autoStart + ", snapshot=" + (snapshotPath ?? "none") + ", tab=" + initialTab);
+                    Application.Run(new MainForm(autoStart, snapshotPath, closeAfterSnapshot, initialTab));
                     Log("Application.Run exited normally");
                 }
                 finally
@@ -644,6 +686,13 @@ namespace ScreenMonitoringApp
         private List<QuickChip> fpsChips = new List<QuickChip>();
         private List<QuickChip> qualityChips = new List<QuickChip>();
 
+        // MobiFlow & Bildirimler (Opera Flow & Notification Mirror)
+        private ModernStudioTabs tabSelector;
+        private MobiFlowPanel pnlFlow;
+        private MobiNotificationsPanel pnlNotifications;
+        private MobiFlowManager flowManager;
+        private int currentTabIndex = 0;
+
         // Sistem Tepsisi (System Tray / Gizli Simgeler)
         private NotifyIcon trayIcon;
         private ContextMenuStrip trayMenu;
@@ -704,7 +753,7 @@ namespace ScreenMonitoringApp
             return null;
         }
 
-        public MainForm(bool autoStart = false, string snapshotPath = null, bool closeAfterSnapshot = false)
+        public MainForm(bool autoStart = false, string snapshotPath = null, bool closeAfterSnapshot = false, int initialTab = 0)
         {
             try { timeBeginPeriod(1); } catch { }
 
@@ -768,11 +817,35 @@ namespace ScreenMonitoringApp
             showFpsOnTablet = AppConfig.ShowFps;
             enableBatterySaver = AppConfig.BatterySaver;
 
+            Program.Log("MainForm ctor 1: config loaded");
+            // MobiFlow & Bildirim Senkronizasyon Yöneticisi
+            try
+            {
+                flowManager = new MobiFlowManager();
+                flowManager.MessageReceived += FlowManager_MessageReceived;
+                flowManager.FileProgress += FlowManager_FileProgress;
+                flowManager.NotificationReceived += FlowManager_NotificationReceived;
+                flowManager.NotificationRemoved += FlowManager_NotificationRemoved;
+                flowManager.DeviceConnectionChanged += FlowManager_DeviceConnectionChanged;
+                flowManager.ConnectionChanged += FlowManager_ConnectionChanged;
+                Program.Log("MainForm ctor 2: flowManager created");
+            }
+            catch (Exception ex)
+            {
+                Program.Log("flowManager init error: " + ex.Message);
+            }
+
+            Program.Log("MainForm ctor 3: calling InitializeStudioUI");
             InitializeStudioUI();
+            Program.Log("MainForm ctor 4: calling ApplyModernWindowStyle");
             ApplyModernWindowStyle();
+            Program.Log("MainForm ctor 5: calling RefreshScreenList");
             RefreshScreenList();
+            Program.Log("MainForm ctor 6: calling ApplyLanguage");
             ApplyLanguage();
+            Program.Log("MainForm ctor 7: calling InitializeTrayIcon");
             InitializeTrayIcon();
+            Program.Log("MainForm ctor 8: ctor finished");
 
             statsTimer = new System.Windows.Forms.Timer();
             statsTimer.Interval = 1000;
@@ -781,6 +854,25 @@ namespace ScreenMonitoringApp
 
             this.Shown += delegate(object s, EventArgs e)
             {
+                Program.Log("MainForm.Shown fired");
+                try
+                {
+                    this.BringToFront();
+                    this.Activate();
+                    ForceForegroundWindow(this.Handle);
+                }
+                catch { }
+
+                if (flowManager != null)
+                {
+                    try { flowManager.Start(); } catch { }
+                }
+
+                if (initialTab > 0 && tabSelector != null)
+                {
+                    tabSelector.SelectedIndex = initialTab;
+                }
+
                 if (!string.IsNullOrEmpty(snapshotPath))
                 {
                     ThreadPool.QueueUserWorkItem(delegate(object state)
@@ -892,8 +984,16 @@ namespace ScreenMonitoringApp
             };
             this.Controls.Add(heroBanner);
 
-            int colY = 122;
-            int colH = Math.Max(404, windowH - colY - 124);
+            // 2.5. MODERN SEKME ÇUBUĞU (EKRAN / FLOW / BİLDİRİMLER)
+            tabSelector = new ModernStudioTabs(18, 116, windowW - 36, 36);
+            tabSelector.SelectedTabChanged += delegate(int tabIndex)
+            {
+                SwitchStudioTab(tabIndex);
+            };
+            this.Controls.Add(tabSelector);
+
+            int colY = 158;
+            int colH = Math.Max(370, windowH - colY - 124);
             int colW = Math.Max(350, (windowW - 36 - 16) / 2);
 
             // ═══════════════════════════════════════════════
@@ -1225,6 +1325,15 @@ namespace ScreenMonitoringApp
 
             this.Controls.Add(pnlBottomBar);
 
+            // 5. MOBIFLOW VE BİLDİRİMLER PANELLERİ
+            pnlFlow = new MobiFlowPanel(18, 158, windowW - 36, windowH - 158 - 18, flowManager);
+            pnlFlow.Visible = false;
+            this.Controls.Add(pnlFlow);
+
+            pnlNotifications = new MobiNotificationsPanel(18, 158, windowW - 36, windowH - 158 - 18, flowManager);
+            pnlNotifications.Visible = false;
+            this.Controls.Add(pnlNotifications);
+
             // Yerleşim düzenini dinamik boyutlara hizala
             LayoutStudioUI();
 
@@ -1258,10 +1367,17 @@ namespace ScreenMonitoringApp
             heroBanner.Location = new Point(18, 52);
             heroBanner.Size = new Size(w - 36, 58);
 
+            // 2.5 Sekme Çubuğu
+            if (tabSelector != null)
+            {
+                tabSelector.Location = new Point(18, 116);
+                tabSelector.Size = new Size(w - 36, 36);
+            }
+
             // 3. İki Sütunlu Kart Izgarası
-            int colY = 122;
+            int colY = 158;
             int bottomSpace = 124; // btnStartStop(50) + pnlBottomBar(50) + boşluklar(24)
-            int colH = Math.Max(404, h - colY - bottomSpace);
+            int colH = Math.Max(370, h - colY - bottomSpace);
             int colW = Math.Max(350, (w - 36 - 16) / 2);
 
             // Sol Panel
@@ -1325,6 +1441,18 @@ namespace ScreenMonitoringApp
             // Sağ Panel
             pnlRightCol.Location = new Point(18 + colW + 16, colY);
             pnlRightCol.Size = new Size(colW, colH);
+
+            // Flow & Bildirim Panelleri (Tam Boyut)
+            if (pnlFlow != null)
+            {
+                pnlFlow.Location = new Point(18, colY);
+                pnlFlow.Size = new Size(w - 36, h - colY - 18);
+            }
+            if (pnlNotifications != null)
+            {
+                pnlNotifications.Location = new Point(18, colY);
+                pnlNotifications.Size = new Size(w - 36, h - colY - 18);
+            }
 
             if (cardPerf != null)
             {
@@ -1636,6 +1764,10 @@ namespace ScreenMonitoringApp
             }
 
             UpdateTrayMenuStrings();
+
+            if (tabSelector != null) tabSelector.UpdateLanguage();
+            if (pnlFlow != null) pnlFlow.ApplyLanguage();
+            if (pnlNotifications != null) pnlNotifications.ApplyLanguage();
         }
 
         // ═══════════════════════════════════════════════
@@ -2012,92 +2144,36 @@ namespace ScreenMonitoringApp
             return "adb";
         }
 
+        public static void RunAdbForwardPort(string adbPath, string serial, int localPort, int remotePort)
+        {
+            try
+            {
+                string args = !string.IsNullOrEmpty(serial)
+                    ? string.Format("-s {0} forward tcp:{1} tcp:{2}", serial, localPort, remotePort)
+                    : string.Format("forward tcp:{1} tcp:{2}", localPort, remotePort);
+
+                ProcessStartInfo psi = new ProcessStartInfo
+                {
+                    FileName = adbPath,
+                    Arguments = args,
+                    UseShellExecute = false,
+                    CreateNoWindow = true
+                };
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(1000);
+                }
+            }
+            catch { }
+        }
+
         private static void RunAdbForward()
         {
             string adbPath = FindAdbPath();
             try
             {
-                List<string> devices = new List<string>();
-                ProcessStartInfo psiList = new ProcessStartInfo
-                {
-                    FileName = adbPath,
-                    Arguments = "devices",
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    CreateNoWindow = true
-                };
-                using (Process p = Process.Start(psiList))
-                {
-                    string output = p.StandardOutput.ReadToEnd();
-                    p.WaitForExit(2000);
-                    string[] lines = output.Split(new char[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
-                    foreach (string line in lines)
-                    {
-                        string trimmed = line.Trim();
-                        if (!trimmed.StartsWith("List") && (trimmed.Contains("\tdevice") || trimmed.EndsWith("device")))
-                        {
-                            string dev = trimmed.Split(new char[] { '\t', ' ' }, StringSplitOptions.RemoveEmptyEntries)[0].Trim();
-                            devices.Add(dev);
-                        }
-                    }
-                }
-
-                string targetDevice = null;
-                if (!string.IsNullOrEmpty(activeTargetSerial))
-                {
-                    targetDevice = activeTargetSerial;
-                }
-                else if (devices.Count == 1)
-                {
-                    targetDevice = devices[0];
-                }
-                else if (devices.Count > 1)
-                {
-                    foreach (string dev in devices)
-                    {
-                        try
-                        {
-                            ProcessStartInfo psiCheck = new ProcessStartInfo
-                            {
-                                FileName = adbPath,
-                                Arguments = string.Format("-s {0} shell pm list packages com.example.screenmonitoring", dev),
-                                UseShellExecute = false,
-                                RedirectStandardOutput = true,
-                                CreateNoWindow = true
-                            };
-                            using (Process pCheck = Process.Start(psiCheck))
-                            {
-                                string outCheck = pCheck.StandardOutput.ReadToEnd();
-                                pCheck.WaitForExit(1000);
-                                if (outCheck.Contains("com.example.screenmonitoring"))
-                                {
-                                    targetDevice = dev;
-                                    break;
-                                }
-                            }
-                        }
-                        catch { }
-                    }
-                    if (targetDevice == null) targetDevice = devices[0];
-                }
-
-                string forwardArgs = !string.IsNullOrEmpty(targetDevice)
-                    ? string.Format("-s {0} forward tcp:55555 tcp:55555", targetDevice)
-                    : "forward tcp:55555 tcp:55555";
-
-                ProcessStartInfo psi = new ProcessStartInfo
-                {
-                    FileName = adbPath,
-                    Arguments = forwardArgs,
-                    UseShellExecute = false,
-                    CreateNoWindow = true
-                };
-
-                using (Process p = Process.Start(psi))
-                {
-                    p.WaitForExit(2000);
-                }
-
+                string targetDevice = !string.IsNullOrEmpty(activeTargetSerial) ? activeTargetSerial : null;
+                RunAdbForwardPort(adbPath, targetDevice, 55555, 55555);
             }
             catch { }
         }
@@ -2219,10 +2295,50 @@ namespace ScreenMonitoringApp
                         L10n.T("Cihazı USB kablosuyla bağlayın • USB Hata Ayıklama açık olmalıdır", "Connect device via USB • USB Debugging must be enabled"),
                         0, 0, 0);
                 }
+                OnConnectedDevicesChanged(new List<ConnectedDeviceItem>());
                 return;
             }
 
             connectedSerials = authorizedDevices;
+
+            // Her bağlı cihaz için ayrı port forward tanımla (55556, 55557, ...)
+            List<ConnectedDeviceItem> connectedItems = new List<ConnectedDeviceItem>();
+            for (int i = 0; i < authorizedDevices.Count; i++)
+            {
+                string ser = authorizedDevices[i];
+                string devModel = ser;
+                foreach (string l in lines)
+                {
+                    if (l.Contains(ser))
+                    {
+                        int mIdx = l.IndexOf("model:");
+                        if (mIdx >= 0)
+                        {
+                            string rem = l.Substring(mIdx + 6).Split(' ')[0].Trim();
+                            if (!string.IsNullOrEmpty(rem)) devModel = rem;
+                        }
+                        break;
+                    }
+                }
+
+                string friendly = devModel;
+                if (devModel.IndexOf("VIA", StringComparison.OrdinalIgnoreCase) >= 0) friendly = "Casper " + devModel;
+                else if (devModel.StartsWith("SM-", StringComparison.OrdinalIgnoreCase) || devModel.StartsWith("SM_", StringComparison.OrdinalIgnoreCase)) friendly = "Samsung " + devModel;
+
+                int flowPort = 55556 + i;
+                RunAdbForwardPort(adbPath, ser, flowPort, 55556);
+
+                ConnectedDeviceItem cItem = new ConnectedDeviceItem
+                {
+                    Serial = ser,
+                    Model = devModel,
+                    FriendlyName = friendly,
+                    FlowPort = flowPort
+                };
+                connectedItems.Add(cItem);
+            }
+
+            OnConnectedDevicesChanged(connectedItems);
 
             string targetSerial = (!string.IsNullOrEmpty(activeTargetSerial) && authorizedDevices.Contains(activeTargetSerial))
                 ? activeTargetSerial
@@ -2262,6 +2378,7 @@ namespace ScreenMonitoringApp
             }
 
             activeTargetSerial = targetSerial;
+            RunAdbForwardPort(adbPath, targetSerial, 55555, 55555);
 
             // Özellikleri sorgula
             string cmd = "getprop ro.product.manufacturer; echo ---; getprop ro.product.model; echo ---; getprop ro.build.version.release; echo ---; wm size; echo ---; wm density; echo ---; pm list packages com.example.screenmonitoring; echo ---; getprop ro.build.characteristics";
@@ -3127,6 +3244,7 @@ namespace ScreenMonitoringApp
             }
             if (!this.Visible)
             {
+                this.Visible = true;
                 this.Show();
             }
             if (this.WindowState == FormWindowState.Minimized)
@@ -3136,6 +3254,8 @@ namespace ScreenMonitoringApp
             this.ShowInTaskbar = true;
             try
             {
+                ShowWindow(this.Handle, 9 /* SW_RESTORE */);
+                ShowWindow(this.Handle, 5 /* SW_SHOW */);
                 ForceForegroundWindow(this.Handle);
                 this.TopMost = true;
                 this.TopMost = false;
@@ -3143,6 +3263,7 @@ namespace ScreenMonitoringApp
             catch { }
             this.Activate();
             this.BringToFront();
+            this.Invalidate(true);
         }
 
         private void UpdateTrayMenuStrings()
@@ -3213,7 +3334,8 @@ namespace ScreenMonitoringApp
             }
             catch { }
 
-            if (!reallyExit && e.CloseReason == CloseReason.UserClosing)
+            // Yalnızca aktif yayın yapılıyorsa arka planda (tepside) çalışmaya devam et
+            if (!reallyExit && e.CloseReason == CloseReason.UserClosing && isStreaming)
             {
                 e.Cancel = true;
                 this.Hide();
@@ -3234,7 +3356,125 @@ namespace ScreenMonitoringApp
                 }
             }
             catch { }
+            try { if (flowManager != null) flowManager.Stop(); } catch { }
             try { timeEndPeriod(1); } catch { }
+        }
+
+        private void SwitchStudioTab(int index)
+        {
+            currentTabIndex = index;
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(delegate { SwitchStudioTab(index); }));
+                return;
+            }
+
+            bool isScreenTab = (index == 0);
+            bool isFlowTab = (index == 1);
+            bool isNotifTab = (index == 2);
+
+            if (pnlLeftCol != null) pnlLeftCol.Visible = isScreenTab;
+            if (pnlRightCol != null) pnlRightCol.Visible = isScreenTab;
+            if (btnStartStop != null) btnStartStop.Visible = isScreenTab;
+            if (pnlBottomBar != null) pnlBottomBar.Visible = isScreenTab;
+
+            if (pnlFlow != null) pnlFlow.Visible = isFlowTab;
+            if (pnlNotifications != null) pnlNotifications.Visible = isNotifTab;
+
+            if (isNotifTab && tabSelector != null)
+            {
+                tabSelector.NotificationBadge = 0;
+            }
+            if (isFlowTab && tabSelector != null)
+            {
+                tabSelector.FlowBadge = 0;
+            }
+
+            this.Invalidate(true);
+        }
+
+        private void SafeInvoke(Action act)
+        {
+            try
+            {
+                if (this.IsDisposed) return;
+                if (!this.IsHandleCreated)
+                {
+                    this.HandleCreated += delegate { SafeInvoke(act); };
+                    return;
+                }
+                if (this.InvokeRequired)
+                {
+                    this.BeginInvoke(act);
+                }
+                else
+                {
+                    act();
+                }
+            }
+            catch { }
+        }
+
+        private void FlowManager_MessageReceived(FlowMessageItem msg)
+        {
+            SafeInvoke(delegate
+            {
+                if (pnlFlow != null) pnlFlow.AddMessage(msg);
+                if (currentTabIndex != 1 && tabSelector != null) tabSelector.FlowBadge++;
+            });
+        }
+
+        private void FlowManager_FileProgress(FlowMessageItem msg)
+        {
+            SafeInvoke(delegate
+            {
+                if (pnlFlow != null) pnlFlow.UpdateFileProgress(msg);
+            });
+        }
+
+        private void FlowManager_NotificationReceived(NotificationCardItem item)
+        {
+            SafeInvoke(delegate
+            {
+                if (pnlNotifications != null) pnlNotifications.AddNotification(item);
+                if (currentTabIndex != 2 && tabSelector != null) tabSelector.NotificationBadge++;
+            });
+        }
+
+        private void FlowManager_NotificationRemoved(string key, string serial)
+        {
+            SafeInvoke(delegate
+            {
+                if (pnlNotifications != null) pnlNotifications.RemoveNotification(key);
+            });
+        }
+
+        private void FlowManager_DeviceConnectionChanged(string serial, bool connected)
+        {
+            SafeInvoke(delegate
+            {
+                if (pnlFlow != null) pnlFlow.UpdateDeviceConnection(serial, connected);
+                if (pnlNotifications != null) pnlNotifications.UpdateDeviceConnection(serial, connected);
+            });
+        }
+
+        private void FlowManager_ConnectionChanged(bool connected)
+        {
+            SafeInvoke(delegate
+            {
+                if (pnlFlow != null) pnlFlow.SetConnected(connected);
+                if (pnlNotifications != null) pnlNotifications.SetConnected(connected);
+            });
+        }
+
+        private void OnConnectedDevicesChanged(List<ConnectedDeviceItem> devices)
+        {
+            SafeInvoke(delegate
+            {
+                if (flowManager != null) flowManager.UpdateDevices(devices);
+                if (pnlFlow != null) pnlFlow.UpdateDeviceList(devices);
+                if (pnlNotifications != null) pnlNotifications.UpdateDeviceList(devices);
+            });
         }
     }
 
@@ -3997,7 +4237,7 @@ namespace ScreenMonitoringApp
             }
 
             Color fg = active ? Color.White : (hovered ? MainForm.ColorText : MainForm.ColorTextMuted);
-            using (Font f = new Font("Segoe UI", 8.5f, active ? FontStyle.Bold : FontStyle.Regular))
+            using (Font f = new Font("Segoe UI Emoji", 8.5f, active ? FontStyle.Bold : FontStyle.Regular))
             {
                 TextRenderer.DrawText(g, text, f, r, fg, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
             }
@@ -4725,6 +4965,7 @@ namespace ScreenMonitoringApp
             if (border.HasValue) this.borderColor = border.Value;
             this.FlatStyle = FlatStyle.Flat;
             this.FlatAppearance.BorderSize = 0;
+            this.Font = new Font("Segoe UI Emoji", 8.5f, FontStyle.Bold);
             this.Cursor = Cursors.Hand;
             this.DoubleBuffered = true;
             this.SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
@@ -5090,6 +5331,278 @@ namespace ScreenMonitoringApp
         public override Color ImageMarginGradientBegin { get { return Color.FromArgb(17, 24, 39); } }
         public override Color ImageMarginGradientMiddle { get { return Color.FromArgb(17, 24, 39); } }
         public override Color ImageMarginGradientEnd { get { return Color.FromArgb(17, 24, 39); } }
+    }
+
+    public class ModernComboBox : Control
+    {
+        private readonly List<object> items = new List<object>();
+        private int selectedIndex = -1;
+        private bool isHovered = false;
+        private bool isDroppedDown = false;
+        private ContextMenuStrip dropDownMenu;
+
+        public event EventHandler SelectedIndexChanged;
+
+        public class ItemCollection : System.Collections.IEnumerable
+        {
+            private readonly ModernComboBox owner;
+            public ItemCollection(ModernComboBox owner) { this.owner = owner; }
+
+            public int Count { get { return owner.items.Count; } }
+
+            public object this[int index]
+            {
+                get { return owner.items[index]; }
+                set { owner.items[index] = value; owner.Invalidate(); }
+            }
+
+            public int Add(object item)
+            {
+                int idx = owner.items.Count;
+                owner.items.Add(item);
+                if (owner.selectedIndex < 0) owner.SelectedIndex = 0;
+                owner.Invalidate();
+                return idx;
+            }
+
+            public void Clear()
+            {
+                owner.items.Clear();
+                owner.selectedIndex = -1;
+                owner.Invalidate();
+            }
+
+            public bool Contains(object item) { return owner.items.Contains(item); }
+            public int IndexOf(object item) { return owner.items.IndexOf(item); }
+            public void Insert(int index, object item) { owner.items.Insert(index, item); owner.Invalidate(); }
+            public void Remove(object item) { owner.items.Remove(item); owner.Invalidate(); }
+            public void RemoveAt(int index) { owner.items.RemoveAt(index); owner.Invalidate(); }
+            public System.Collections.IEnumerator GetEnumerator() { return owner.items.GetEnumerator(); }
+        }
+
+        private ItemCollection itemsCollection;
+        public ItemCollection Items { get { return itemsCollection; } }
+
+        public int SelectedIndex
+        {
+            get { return selectedIndex; }
+            set
+            {
+                if (selectedIndex != value)
+                {
+                    if (value >= 0 && value < items.Count)
+                        selectedIndex = value;
+                    else
+                        selectedIndex = -1;
+
+                    this.Invalidate();
+                    if (SelectedIndexChanged != null)
+                    {
+                        SelectedIndexChanged(this, EventArgs.Empty);
+                    }
+                }
+            }
+        }
+
+        public object SelectedItem
+        {
+            get
+            {
+                if (selectedIndex >= 0 && selectedIndex < items.Count)
+                    return items[selectedIndex];
+                return null;
+            }
+            set
+            {
+                int idx = items.IndexOf(value);
+                SelectedIndex = idx;
+            }
+        }
+
+        public string SelectedText
+        {
+            get
+            {
+                object item = SelectedItem;
+                return item != null ? item.ToString() : string.Empty;
+            }
+        }
+
+        public ModernComboBox()
+        {
+            this.itemsCollection = new ItemCollection(this);
+            this.Size = new Size(210, 28);
+            this.DoubleBuffered = true;
+            this.SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.Selectable, true);
+            this.BackColor = Color.FromArgb(20, 26, 40);
+            this.ForeColor = MainForm.ColorText;
+            this.Font = new Font("Segoe UI", 8.5f, FontStyle.Regular);
+            this.Cursor = Cursors.Hand;
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            isHovered = true;
+            this.Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            isHovered = false;
+            this.Invalidate();
+        }
+
+        protected override void OnClick(EventArgs e)
+        {
+            base.OnClick(e);
+            this.Focus();
+            ShowDropDown();
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            base.OnKeyDown(e);
+            if (e.KeyCode == Keys.Down)
+            {
+                if (SelectedIndex < items.Count - 1) SelectedIndex++;
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Up)
+            {
+                if (SelectedIndex > 0) SelectedIndex--;
+                e.Handled = true;
+            }
+            else if (e.KeyCode == Keys.Enter || e.KeyCode == Keys.Space)
+            {
+                ShowDropDown();
+                e.Handled = true;
+            }
+        }
+
+        public void ShowDropDown()
+        {
+            if (items.Count == 0) return;
+
+            if (dropDownMenu != null)
+            {
+                dropDownMenu.Dispose();
+                dropDownMenu = null;
+            }
+
+            dropDownMenu = new ContextMenuStrip();
+            dropDownMenu.Renderer = new DarkMenuRenderer();
+            dropDownMenu.BackColor = Color.FromArgb(17, 24, 39);
+            dropDownMenu.ShowImageMargin = false;
+            dropDownMenu.Font = this.Font;
+            dropDownMenu.MinimumSize = new Size(this.Width, 0);
+
+            for (int i = 0; i < items.Count; i++)
+            {
+                int itemIndex = i;
+                object itemObj = items[i];
+                string itemText = itemObj != null ? itemObj.ToString() : "";
+
+                ToolStripMenuItem menuItem = new ToolStripMenuItem(itemText);
+                menuItem.AutoSize = false;
+                menuItem.Height = 28;
+                menuItem.Width = Math.Max(this.Width, 240);
+                menuItem.ForeColor = (itemIndex == selectedIndex) ? MainForm.ColorAccent : MainForm.ColorText;
+                menuItem.Font = (itemIndex == selectedIndex) ? new Font(this.Font, FontStyle.Bold) : this.Font;
+
+                menuItem.Click += delegate
+                {
+                    this.SelectedIndex = itemIndex;
+                };
+
+                dropDownMenu.Items.Add(menuItem);
+            }
+
+            isDroppedDown = true;
+            this.Invalidate();
+
+            dropDownMenu.Closed += delegate
+            {
+                isDroppedDown = false;
+                this.Invalidate();
+            };
+
+            dropDownMenu.Show(this, new Point(0, this.Height + 2));
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            Color pBg = (this.Parent != null) ? this.Parent.BackColor : MainForm.ColorCard;
+            using (SolidBrush b = new SolidBrush(pBg))
+            {
+                g.FillRectangle(b, this.ClientRectangle);
+            }
+
+            Rectangle rect = new Rectangle(0, 0, this.Width - 1, this.Height - 1);
+
+            Color bg = (isHovered || isDroppedDown || this.Focused) ? Color.FromArgb(26, 35, 52) : Color.FromArgb(20, 26, 40);
+            using (GraphicsPath path = RoundedPanel.CreateRoundedRect(rect, 6))
+            {
+                using (SolidBrush b = new SolidBrush(bg))
+                {
+                    g.FillPath(b, path);
+                }
+
+                Color borderCol = (isHovered || isDroppedDown || this.Focused) ? MainForm.ColorPrimary : MainForm.ColorCardBorder;
+                using (Pen p = new Pen(borderCol, 1.2f))
+                {
+                    g.DrawPath(p, path);
+                }
+            }
+
+            int btnW = 26;
+            Rectangle btnRect = new Rectangle(this.Width - btnW, 0, btnW, this.Height);
+            int cx = btnRect.X + (btnRect.Width / 2);
+            int cy = btnRect.Y + (btnRect.Height / 2);
+
+            Color chevronColor = (isHovered || isDroppedDown) ? MainForm.ColorAccent : MainForm.ColorTextMuted;
+            using (Pen cp = new Pen(chevronColor, 1.8f))
+            {
+                cp.StartCap = LineCap.Round;
+                cp.EndCap = LineCap.Round;
+                cp.LineJoin = LineJoin.Round;
+
+                if (isDroppedDown)
+                {
+                    Point[] pts = new Point[]
+                    {
+                        new Point(cx - 4, cy + 2),
+                        new Point(cx, cy - 2),
+                        new Point(cx + 4, cy + 2)
+                    };
+                    g.DrawLines(cp, pts);
+                }
+                else
+                {
+                    Point[] pts = new Point[]
+                    {
+                        new Point(cx - 4, cy - 2),
+                        new Point(cx, cy + 2),
+                        new Point(cx + 4, cy - 2)
+                    };
+                    g.DrawLines(cp, pts);
+                }
+            }
+
+            string text = SelectedText;
+            if (!string.IsNullOrEmpty(text))
+            {
+                Rectangle textRect = new Rectangle(10, 0, this.Width - btnW - 10, this.Height);
+                TextRenderer.DrawText(g, text, this.Font, textRect, MainForm.ColorText,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            }
+        }
     }
 
     public enum VirtualModalMode
@@ -5658,6 +6171,1913 @@ namespace ScreenMonitoringApp
         public static string T(string tr, string en)
         {
             return IsEnglish ? en : tr;
+        }
+    }
+
+    // ═══════════════════════════════════════════════
+    // MOBIDESK FLOW & BİLDİRİM SENKRONİZASYON PROTOKOLÜ (C# 5 UYUMLU)
+    // ═══════════════════════════════════════════════
+
+    public static class MobiFlowProtocol
+    {
+        public const int PORT = 55556;
+        public static readonly byte[] MAGIC = new byte[] { 0x4D, 0x46 }; // "MF"
+
+        public const short TYPE_TEXT = 0x0001;
+        public const short TYPE_FILE_START = 0x0002;
+        public const short TYPE_FILE_CHUNK = 0x0003;
+        public const short TYPE_FILE_END = 0x0004;
+        public const short TYPE_NOTIFICATION = 0x0005;
+        public const short TYPE_NOTIFICATION_REMOVE = 0x0006;
+        public const short TYPE_PING = 0x0007;
+        public const short TYPE_PONG = 0x0008;
+        public const short TYPE_DISMISS_NOTIFICATION = 0x0009;
+
+        public static void WriteNetUTF(BinaryWriter bw, string s)
+        {
+            byte[] bytes = Encoding.UTF8.GetBytes(s ?? "");
+            bw.Write(IPAddress.HostToNetworkOrder((short)bytes.Length));
+            bw.Write(bytes);
+        }
+
+        public static string ReadNetUTF(BinaryReader br)
+        {
+            short len = IPAddress.NetworkToHostOrder(br.ReadInt16());
+            if (len <= 0) return "";
+            byte[] bytes = br.ReadBytes(len);
+            return Encoding.UTF8.GetString(bytes);
+        }
+
+        public static void WriteNetInt64(BinaryWriter bw, long val)
+        {
+            bw.Write(IPAddress.HostToNetworkOrder(val));
+        }
+
+        public static long ReadNetInt64(BinaryReader br)
+        {
+            return IPAddress.NetworkToHostOrder(br.ReadInt64());
+        }
+
+        public static void WriteNetInt32(BinaryWriter bw, int val)
+        {
+            bw.Write(IPAddress.HostToNetworkOrder(val));
+        }
+
+        public static int ReadNetInt32(BinaryReader br)
+        {
+            return IPAddress.NetworkToHostOrder(br.ReadInt32());
+        }
+    }
+
+    public class FlowMessageItem
+    {
+        public string Id { get; set; }
+        public string Sender { get; set; } // "pc" or "mobile"
+        public string Text { get; set; }
+        public long Timestamp { get; set; }
+        public bool IsFile { get; set; }
+        public string FileName { get; set; }
+        public long FileSize { get; set; }
+        public string FilePath { get; set; }
+        public int Progress { get; set; }
+        public string DeviceSerial { get; set; }
+        public string DeviceName { get; set; }
+
+        public FlowMessageItem()
+        {
+            Progress = 100;
+        }
+    }
+
+    public class NotificationCardItem
+    {
+        public int Id { get; set; }
+        public string Key { get; set; }
+        public string PackageName { get; set; }
+        public string AppName { get; set; }
+        public string Title { get; set; }
+        public string Text { get; set; }
+        public long Timestamp { get; set; }
+        public string IconBase64 { get; set; }
+        public Image CachedIcon { get; set; }
+        public string DeviceSerial { get; set; }
+        public string DeviceName { get; set; }
+    }
+
+    public class ConnectedDeviceItem
+    {
+        public string Serial { get; set; }
+        public string Model { get; set; }
+        public string FriendlyName { get; set; }
+        public int FlowPort { get; set; }
+
+        public override string ToString()
+        {
+            return FriendlyName + " (" + Serial + ")";
+        }
+    }
+
+    public static class MiniJson
+    {
+        public static Dictionary<string, string> Parse(string json)
+        {
+            Dictionary<string, string> dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrEmpty(json)) return dict;
+            System.Text.RegularExpressions.Regex regex = new System.Text.RegularExpressions.Regex("\"(?<key>[^\"]+)\"\\s*:\\s*(\"(?<val>[^\"]*)\"|(?<val>[^,}\\]]+))");
+            System.Text.RegularExpressions.MatchCollection matches = regex.Matches(json);
+            foreach (System.Text.RegularExpressions.Match m in matches)
+            {
+                dict[m.Groups["key"].Value] = m.Groups["val"].Value.Trim();
+            }
+            return dict;
+        }
+
+        public static string Escape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\r", "\\r").Replace("\n", "\\n").Replace("\t", "\\t");
+        }
+    }
+
+    public class MobiFlowDeviceSession
+    {
+        public string Serial { get; set; }
+        public string FriendlyName { get; set; }
+        public int Port { get; set; }
+        public volatile bool IsConnected = false;
+
+        private MobiFlowManager manager;
+        private volatile bool isRunning = true;
+        private Thread clientThread;
+        private TcpClient activeClient;
+        private NetworkStream activeStream;
+        private readonly object sendLock = new object();
+
+        private readonly Dictionary<string, FileStream> activeReceivingFiles = new Dictionary<string, FileStream>();
+        private readonly Dictionary<string, FlowMessageItem> activeFileItems = new Dictionary<string, FlowMessageItem>();
+
+        public MobiFlowDeviceSession(MobiFlowManager mgr, string serial, string friendlyName, int port)
+        {
+            this.manager = mgr;
+            this.Serial = serial;
+            this.FriendlyName = friendlyName;
+            this.Port = port;
+        }
+
+        public void Start()
+        {
+            if (clientThread != null && clientThread.IsAlive) return;
+            isRunning = true;
+            clientThread = new Thread(ClientWorkerLoop);
+            clientThread.IsBackground = true;
+            clientThread.Start();
+        }
+
+        public void Stop()
+        {
+            isRunning = false;
+            lock (sendLock)
+            {
+                try { if (activeStream != null) activeStream.Close(); } catch { }
+                try { if (activeClient != null) activeClient.Close(); } catch { }
+                activeStream = null;
+                activeClient = null;
+            }
+            IsConnected = false;
+            manager.NotifyDeviceConnectionChanged(Serial, false);
+        }
+
+        private void ClientWorkerLoop()
+        {
+            while (isRunning)
+            {
+                TcpClient client = null;
+                try
+                {
+                    client = new TcpClient();
+                    client.NoDelay = true;
+                    client.SendBufferSize = 64 * 1024;
+                    client.ReceiveBufferSize = 64 * 1024;
+                    client.Connect("127.0.0.1", Port);
+
+                    lock (sendLock)
+                    {
+                        activeClient = client;
+                        activeStream = client.GetStream();
+                    }
+
+                    IsConnected = true;
+                    manager.NotifyDeviceConnectionChanged(Serial, true);
+                    Program.Log("Connected to MobiFlow on port " + Port + " for " + Serial);
+
+                    BinaryReader br = new BinaryReader(activeStream);
+                    while (isRunning && client.Connected)
+                    {
+                        int m0 = br.ReadByte();
+                        int m1 = br.ReadByte();
+                        if (m0 != 0x4D || m1 != 0x46)
+                        {
+                            continue;
+                        }
+
+                        short type = IPAddress.NetworkToHostOrder(br.ReadInt16());
+                        int len = IPAddress.NetworkToHostOrder(br.ReadInt32());
+                        if (len < 0 || len > 100 * 1024 * 1024) break;
+
+                        byte[] payload = new byte[len];
+                        int totalRead = 0;
+                        while (totalRead < len)
+                        {
+                            int r = br.Read(payload, totalRead, len - totalRead);
+                            if (r <= 0) throw new IOException("Disconnected while reading payload");
+                            totalRead += r;
+                        }
+
+                        ProcessIncomingPacket(type, payload);
+                    }
+                }
+                catch
+                {
+                    // Disconnected or connection refused
+                }
+                finally
+                {
+                    lock (sendLock)
+                    {
+                        try { if (client != null) client.Close(); } catch { }
+                        if (activeClient == client)
+                        {
+                            activeClient = null;
+                            activeStream = null;
+                        }
+                    }
+                    IsConnected = false;
+                    manager.NotifyDeviceConnectionChanged(Serial, false);
+                }
+
+                if (isRunning) Thread.Sleep(1500);
+            }
+        }
+
+        private void ProcessIncomingPacket(short type, byte[] payload)
+        {
+            try
+            {
+                if (type == MobiFlowProtocol.TYPE_TEXT)
+                {
+                    string json = Encoding.UTF8.GetString(payload);
+                    Program.Log("PC received TYPE_TEXT from " + this.Serial + " (" + this.FriendlyName + "): " + json);
+                    Dictionary<string, string> dict = MiniJson.Parse(json);
+                    FlowMessageItem item = new FlowMessageItem();
+                    item.Id = dict.ContainsKey("id") ? dict["id"] : Guid.NewGuid().ToString();
+                    item.Sender = dict.ContainsKey("sender") ? dict["sender"] : "mobile";
+                    item.Text = dict.ContainsKey("text") ? dict["text"] : json;
+                    item.Timestamp = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+                    item.DeviceSerial = this.Serial;
+                    item.DeviceName = this.FriendlyName;
+                    manager.DispatchMessageReceived(item);
+                }
+                else if (type == MobiFlowProtocol.TYPE_FILE_START)
+                {
+                    string json = Encoding.UTF8.GetString(payload);
+                    Dictionary<string, string> dict = MiniJson.Parse(json);
+                    string transferId = dict.ContainsKey("transferId") ? dict["transferId"] : Guid.NewGuid().ToString();
+                    string fileName = dict.ContainsKey("fileName") ? dict["fileName"] : "dosya";
+                    long fileSize = 0;
+                    if (dict.ContainsKey("fileSize")) long.TryParse(dict["fileSize"], out fileSize);
+
+                    string targetPath = Path.Combine(MobiFlowManager.DownloadsFolder, fileName);
+                    FileStream fs = new FileStream(targetPath, FileMode.Create, FileAccess.Write, FileShare.Read);
+                    activeReceivingFiles[transferId] = fs;
+
+                    FlowMessageItem item = new FlowMessageItem();
+                    item.Id = transferId;
+                    item.Sender = "mobile";
+                    item.IsFile = true;
+                    item.FileName = fileName;
+                    item.FileSize = fileSize;
+                    item.FilePath = targetPath;
+                    item.Progress = 0;
+                    item.Timestamp = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+                    item.DeviceSerial = this.Serial;
+                    item.DeviceName = this.FriendlyName;
+                    activeFileItems[transferId] = item;
+
+                    manager.DispatchMessageReceived(item);
+                }
+                else if (type == MobiFlowProtocol.TYPE_FILE_CHUNK)
+                {
+                    using (MemoryStream ms = new MemoryStream(payload))
+                    using (BinaryReader br = new BinaryReader(ms))
+                    {
+                        string transferId = MobiFlowProtocol.ReadNetUTF(br);
+                        long offset = MobiFlowProtocol.ReadNetInt64(br);
+                        int chunkLen = MobiFlowProtocol.ReadNetInt32(br);
+                        byte[] chunk = br.ReadBytes(chunkLen);
+
+                        FileStream fs;
+                        if (activeReceivingFiles.TryGetValue(transferId, out fs))
+                        {
+                            fs.Write(chunk, 0, chunk.Length);
+                            FlowMessageItem item;
+                            if (activeFileItems.TryGetValue(transferId, out item) && item.FileSize > 0)
+                            {
+                                long totalSoFar = offset + chunkLen;
+                                item.Progress = (int)Math.Min(99, (totalSoFar * 100) / item.FileSize);
+                                manager.DispatchFileProgress(item);
+                            }
+                        }
+                    }
+                }
+                else if (type == MobiFlowProtocol.TYPE_FILE_END)
+                {
+                    string json = Encoding.UTF8.GetString(payload);
+                    Dictionary<string, string> dict = MiniJson.Parse(json);
+                    string transferId = dict.ContainsKey("transferId") ? dict["transferId"] : "";
+
+                    FileStream fs;
+                    if (activeReceivingFiles.TryGetValue(transferId, out fs))
+                    {
+                        fs.Flush();
+                        fs.Close();
+                        activeReceivingFiles.Remove(transferId);
+                    }
+
+                    FlowMessageItem item;
+                    if (activeFileItems.TryGetValue(transferId, out item))
+                    {
+                        item.Progress = 100;
+                        activeFileItems.Remove(transferId);
+                        manager.DispatchFileProgress(item);
+                    }
+                }
+                else if (type == MobiFlowProtocol.TYPE_NOTIFICATION)
+                {
+                    string json = Encoding.UTF8.GetString(payload);
+                    Dictionary<string, string> dict = MiniJson.Parse(json);
+                    NotificationCardItem notif = new NotificationCardItem();
+                    int id = 0;
+                    if (dict.ContainsKey("id")) int.TryParse(dict["id"], out id);
+                    notif.Id = id;
+                    notif.Key = dict.ContainsKey("key") ? dict["key"] : "";
+                    notif.PackageName = dict.ContainsKey("pkg") ? dict["pkg"] : "";
+                    notif.AppName = dict.ContainsKey("app") ? dict["app"] : notif.PackageName;
+                    notif.Title = dict.ContainsKey("title") ? dict["title"] : "";
+                    notif.Text = dict.ContainsKey("text") ? dict["text"] : "";
+                    notif.IconBase64 = dict.ContainsKey("icon") ? dict["icon"] : null;
+                    notif.Timestamp = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+                    notif.DeviceSerial = this.Serial;
+                    notif.DeviceName = this.FriendlyName;
+
+                    if (!string.IsNullOrEmpty(notif.IconBase64))
+                    {
+                        try
+                        {
+                            byte[] imgBytes = Convert.FromBase64String(notif.IconBase64);
+                            using (MemoryStream ms = new MemoryStream(imgBytes))
+                            using (Bitmap temp = new Bitmap(ms))
+                            {
+                                notif.CachedIcon = new Bitmap(temp);
+                            }
+                        }
+                        catch { }
+                    }
+
+                    manager.DispatchNotificationReceived(notif);
+                }
+                else if (type == MobiFlowProtocol.TYPE_NOTIFICATION_REMOVE)
+                {
+                    string str = Encoding.UTF8.GetString(payload);
+                    string[] parts = str.Split('\t');
+                    string key = (parts.Length >= 3) ? parts[2] : (parts.Length >= 1 ? parts[0] : "");
+                    manager.DispatchNotificationRemoved(key, this.Serial);
+                }
+                else if (type == MobiFlowProtocol.TYPE_PING)
+                {
+                    SendRawPacket(MobiFlowProtocol.TYPE_PONG, new byte[0]);
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.Log("Session ProcessIncomingPacket error: " + ex.Message);
+            }
+        }
+
+        public FlowMessageItem SendTextMessage(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            string id = Guid.NewGuid().ToString();
+            long time = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+            string json = string.Format("{{\"id\":\"{0}\",\"sender\":\"pc\",\"text\":\"{1}\",\"timestamp\":{2}}}",
+                id, MiniJson.Escape(text), time);
+
+            FlowMessageItem item = new FlowMessageItem();
+            item.Id = id;
+            item.Sender = "pc";
+            item.Text = text;
+            item.Timestamp = time;
+            item.DeviceSerial = this.Serial;
+            item.DeviceName = this.FriendlyName;
+
+            SendRawPacket(MobiFlowProtocol.TYPE_TEXT, Encoding.UTF8.GetBytes(json));
+            manager.DispatchMessageReceived(item);
+            return item;
+        }
+
+        public FlowMessageItem SendFile(string filePath, Action<int> onProgress = null)
+        {
+            if (!File.Exists(filePath)) return null;
+            string transferId = Guid.NewGuid().ToString();
+            FileInfo fi = new FileInfo(filePath);
+            string fileName = fi.Name;
+            long fileSize = fi.Length;
+
+            FlowMessageItem item = new FlowMessageItem();
+            item.Id = transferId;
+            item.Sender = "pc";
+            item.IsFile = true;
+            item.FileName = fileName;
+            item.FileSize = fileSize;
+            item.FilePath = filePath;
+            item.Progress = 0;
+            item.Timestamp = DateTime.Now.Ticks / TimeSpan.TicksPerMillisecond;
+            item.DeviceSerial = this.Serial;
+            item.DeviceName = this.FriendlyName;
+
+            manager.DispatchMessageReceived(item);
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    // 1. FILE_START
+                    string startJson = string.Format("{{\"transferId\":\"{0}\",\"fileName\":\"{1}\",\"fileSize\":{2}}}",
+                        transferId, MiniJson.Escape(fileName), fileSize);
+                    SendRawPacket(MobiFlowProtocol.TYPE_FILE_START, Encoding.UTF8.GetBytes(startJson));
+
+                    // 2. FILE_CHUNKS (64 KB)
+                    byte[] buffer = new byte[64 * 1024];
+                    using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+                    {
+                        long offset = 0;
+                        int read;
+                        while ((read = fs.Read(buffer, 0, buffer.Length)) > 0 && isRunning)
+                        {
+                            using (MemoryStream ms = new MemoryStream())
+                            using (BinaryWriter bw = new BinaryWriter(ms))
+                            {
+                                MobiFlowProtocol.WriteNetUTF(bw, transferId);
+                                MobiFlowProtocol.WriteNetInt64(bw, offset);
+                                MobiFlowProtocol.WriteNetInt32(bw, read);
+                                bw.Write(buffer, 0, read);
+                                bw.Flush();
+
+                                SendRawPacket(MobiFlowProtocol.TYPE_FILE_CHUNK, ms.ToArray());
+                            }
+                            offset += read;
+                            int pct = (int)Math.Min(99, (offset * 100) / fileSize);
+                            item.Progress = pct;
+                            manager.DispatchFileProgress(item);
+                            if (onProgress != null) onProgress(pct);
+                        }
+                    }
+
+                    // 3. FILE_END
+                    string endJson = string.Format("{{\"transferId\":\"{0}\",\"status\":\"OK\"}}", transferId);
+                    SendRawPacket(MobiFlowProtocol.TYPE_FILE_END, Encoding.UTF8.GetBytes(endJson));
+
+                    item.Progress = 100;
+                    manager.DispatchFileProgress(item);
+                    if (onProgress != null) onProgress(100);
+                }
+                catch (Exception ex)
+                {
+                    Program.Log("SendFile error: " + ex.Message);
+                }
+            });
+
+            return item;
+        }
+
+        public void DismissNotification(string pkg, int id, string key)
+        {
+            string str = string.Format("{0}\t{1}\t{2}", pkg, id, key);
+            SendRawPacket(MobiFlowProtocol.TYPE_DISMISS_NOTIFICATION, Encoding.UTF8.GetBytes(str));
+        }
+
+        public bool SendRawPacket(short type, byte[] payload)
+        {
+            lock (sendLock)
+            {
+                if (activeStream == null || activeClient == null || !activeClient.Connected)
+                    return false;
+
+                try
+                {
+                    byte[] header = new byte[8];
+                    header[0] = MobiFlowProtocol.MAGIC[0];
+                    header[1] = MobiFlowProtocol.MAGIC[1];
+
+                    short netType = IPAddress.HostToNetworkOrder(type);
+                    header[2] = (byte)(netType & 0xFF);
+                    header[3] = (byte)((netType >> 8) & 0xFF);
+
+                    int netLen = IPAddress.HostToNetworkOrder(payload != null ? payload.Length : 0);
+                    header[4] = (byte)(netLen & 0xFF);
+                    header[5] = (byte)((netLen >> 8) & 0xFF);
+                    header[6] = (byte)((netLen >> 16) & 0xFF);
+                    header[7] = (byte)((netLen >> 24) & 0xFF);
+
+                    activeStream.Write(header, 0, 8);
+                    if (payload != null && payload.Length > 0)
+                    {
+                        activeStream.Write(payload, 0, payload.Length);
+                    }
+                    activeStream.Flush();
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+    }
+
+    public class MobiFlowManager
+    {
+        public static readonly string DownloadsFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads", "MobiDesk");
+
+        private volatile bool isRunning = false;
+        private readonly Dictionary<string, MobiFlowDeviceSession> activeSessions = new Dictionary<string, MobiFlowDeviceSession>(StringComparer.OrdinalIgnoreCase);
+        private readonly object sessionsLock = new object();
+
+        public event Action<FlowMessageItem> MessageReceived;
+        public event Action<FlowMessageItem> FileProgress;
+        public event Action<NotificationCardItem> NotificationReceived;
+        public event Action<string, string> NotificationRemoved;
+        public event Action<string, bool> DeviceConnectionChanged;
+        public event Action<bool> ConnectionChanged;
+
+        public MobiFlowManager()
+        {
+            try
+            {
+                if (!Directory.Exists(DownloadsFolder))
+                {
+                    Directory.CreateDirectory(DownloadsFolder);
+                }
+            }
+            catch { }
+        }
+
+        public void Start()
+        {
+            if (isRunning) return;
+            isRunning = true;
+            lock (sessionsLock)
+            {
+                if (activeSessions.Count == 0)
+                {
+                    MobiFlowDeviceSession fallback = new MobiFlowDeviceSession(this, "default", "Android", MobiFlowProtocol.PORT);
+                    activeSessions["default"] = fallback;
+                    fallback.Start();
+                }
+            }
+        }
+
+        public void Stop()
+        {
+            isRunning = false;
+            lock (sessionsLock)
+            {
+                foreach (var s in activeSessions.Values)
+                {
+                    try { s.Stop(); } catch { }
+                }
+                activeSessions.Clear();
+            }
+            if (ConnectionChanged != null) ConnectionChanged(false);
+        }
+
+        public bool IsConnected(string serial = null)
+        {
+            lock (sessionsLock)
+            {
+                if (string.IsNullOrEmpty(serial))
+                {
+                    foreach (var s in activeSessions.Values)
+                        if (s.IsConnected) return true;
+                    return false;
+                }
+                MobiFlowDeviceSession sDev;
+                if (activeSessions.TryGetValue(serial, out sDev))
+                    return sDev.IsConnected;
+                return false;
+            }
+        }
+
+        public void UpdateDevices(List<ConnectedDeviceItem> devices)
+        {
+            if (!isRunning) isRunning = true;
+            lock (sessionsLock)
+            {
+                if (devices != null && devices.Count > 0 && activeSessions.ContainsKey("default"))
+                {
+                    activeSessions["default"].Stop();
+                    activeSessions.Remove("default");
+                }
+
+                HashSet<string> currentSerials = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                if (devices != null)
+                {
+                    foreach (var dev in devices)
+                    {
+                        currentSerials.Add(dev.Serial);
+                        MobiFlowDeviceSession session;
+                        if (!activeSessions.TryGetValue(dev.Serial, out session))
+                        {
+                            session = new MobiFlowDeviceSession(this, dev.Serial, dev.FriendlyName, dev.FlowPort);
+                            activeSessions[dev.Serial] = session;
+                            session.Start();
+                        }
+                        else
+                        {
+                            session.FriendlyName = dev.FriendlyName;
+                            if (session.Port != dev.FlowPort)
+                            {
+                                session.Stop();
+                                session.Port = dev.FlowPort;
+                                session.Start();
+                            }
+                        }
+                    }
+                }
+
+                List<string> toRemove = new List<string>();
+                foreach (var kvp in activeSessions)
+                {
+                    if (kvp.Key != "default" && !currentSerials.Contains(kvp.Key))
+                    {
+                        toRemove.Add(kvp.Key);
+                        kvp.Value.Stop();
+                    }
+                }
+                foreach (string s in toRemove) activeSessions.Remove(s);
+            }
+        }
+
+        private MobiFlowDeviceSession GetSession(string targetSerial)
+        {
+            lock (sessionsLock)
+            {
+                if (!string.IsNullOrEmpty(targetSerial))
+                {
+                    MobiFlowDeviceSession s;
+                    if (activeSessions.TryGetValue(targetSerial, out s)) return s;
+                }
+                foreach (var s in activeSessions.Values)
+                {
+                    if (s.IsConnected) return s;
+                }
+                foreach (var s in activeSessions.Values) return s;
+                return null;
+            }
+        }
+
+        public FlowMessageItem SendTextMessage(string text, string targetSerial = null)
+        {
+            MobiFlowDeviceSession s = GetSession(targetSerial);
+            if (s != null) return s.SendTextMessage(text);
+            return null;
+        }
+
+        public FlowMessageItem SendFile(string filePath, string targetSerial = null, Action<int> onProgress = null)
+        {
+            MobiFlowDeviceSession s = GetSession(targetSerial);
+            if (s != null) return s.SendFile(filePath, onProgress);
+            return null;
+        }
+
+        public void DismissNotification(string pkg, int id, string key, string deviceSerial = null)
+        {
+            MobiFlowDeviceSession s = GetSession(deviceSerial);
+            if (s != null) s.DismissNotification(pkg, id, key);
+        }
+
+        internal void DispatchMessageReceived(FlowMessageItem item)
+        {
+            if (MessageReceived != null) MessageReceived(item);
+        }
+
+        internal void DispatchFileProgress(FlowMessageItem item)
+        {
+            if (FileProgress != null) FileProgress(item);
+        }
+
+        internal void DispatchNotificationReceived(NotificationCardItem notif)
+        {
+            if (NotificationReceived != null) NotificationReceived(notif);
+        }
+
+        internal void DispatchNotificationRemoved(string key, string serial)
+        {
+            if (NotificationRemoved != null) NotificationRemoved(key, serial);
+        }
+
+        internal void NotifyDeviceConnectionChanged(string serial, bool connected)
+        {
+            if (DeviceConnectionChanged != null) DeviceConnectionChanged(serial, connected);
+            if (ConnectionChanged != null) ConnectionChanged(IsConnected());
+        }
+    }
+
+    public class ModernStudioTabs : Panel
+    {
+        private int selectedIndex = 0;
+        public event Action<int> SelectedTabChanged;
+
+        private int flowBadge = 0;
+        private int notificationBadge = 0;
+
+        public int FlowBadge
+        {
+            get { return flowBadge; }
+            set { flowBadge = value; this.Invalidate(); }
+        }
+
+        public int NotificationBadge
+        {
+            get { return notificationBadge; }
+            set { notificationBadge = value; this.Invalidate(); }
+        }
+
+        public int SelectedIndex
+        {
+            get { return selectedIndex; }
+            set
+            {
+                if (selectedIndex != value)
+                {
+                    selectedIndex = value;
+                    this.Invalidate();
+                    if (SelectedTabChanged != null) SelectedTabChanged(selectedIndex);
+                }
+            }
+        }
+
+        private string[] tabTitles = new string[]
+        {
+            "🖥️ İkinci Ekran",
+            "💬 MobiFlow",
+            "🔔 Bildirimler"
+        };
+
+        public void UpdateLanguage()
+        {
+            tabTitles = new string[]
+            {
+                L10n.T("🖥️ İkinci Ekran", "🖥️ Second Screen"),
+                "💬 MobiFlow",
+                L10n.T("🔔 Bildirimler", "🔔 Notifications")
+            };
+            this.Invalidate();
+        }
+
+        private int hoveredIndex = -1;
+
+        public ModernStudioTabs(int x, int y, int width, int height)
+        {
+            this.Location = new Point(x, y);
+            this.Size = new Size(width, height);
+            this.BackColor = MainForm.ColorBg;
+            this.DoubleBuffered = true;
+            this.SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            UpdateLanguage();
+
+            this.MouseMove += delegate(object s, MouseEventArgs e)
+            {
+                int tabW = this.Width / 3;
+                int hIdx = Math.Min(2, Math.Max(0, e.X / tabW));
+                if (hoveredIndex != hIdx)
+                {
+                    hoveredIndex = hIdx;
+                    this.Cursor = Cursors.Hand;
+                    this.Invalidate();
+                }
+            };
+
+            this.MouseLeave += delegate(object s, EventArgs e)
+            {
+                hoveredIndex = -1;
+                this.Cursor = Cursors.Default;
+                this.Invalidate();
+            };
+
+            this.MouseDown += delegate(object s, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left)
+                {
+                    int tabW = this.Width / 3;
+                    SelectedIndex = Math.Min(2, Math.Max(0, e.X / tabW));
+                }
+            };
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+            int tabW = this.Width / 3;
+            int tabH = this.Height;
+
+            // Arka plan rayı (Track)
+            using (GraphicsPath trackPath = CreateRoundedRectanglePath(new Rectangle(0, 0, this.Width - 1, tabH - 1), 8))
+            using (SolidBrush trackBrush = new SolidBrush(Color.FromArgb(18, 24, 38)))
+            using (Pen trackPen = new Pen(MainForm.ColorCardBorder, 1.0f))
+            {
+                g.FillPath(trackBrush, trackPath);
+                g.DrawPath(trackPen, trackPath);
+            }
+
+            for (int i = 0; i < 3; i++)
+            {
+                Rectangle tabRect = new Rectangle(i * tabW + 2, 2, tabW - 4, tabH - 4);
+                bool isSelected = (i == selectedIndex);
+                bool isHovered = (i == hoveredIndex && !isSelected);
+
+                if (isSelected)
+                {
+                    using (GraphicsPath selPath = CreateRoundedRectanglePath(tabRect, 6))
+                    using (LinearGradientBrush selBrush = new LinearGradientBrush(tabRect, MainForm.ColorPrimary, MainForm.ColorPrimaryDark, 90f))
+                    {
+                        g.FillPath(selBrush, selPath);
+                    }
+                }
+                else if (isHovered)
+                {
+                    using (GraphicsPath hovPath = CreateRoundedRectanglePath(tabRect, 6))
+                    using (SolidBrush hovBrush = new SolidBrush(Color.FromArgb(28, 38, 58)))
+                    {
+                        g.FillPath(hovBrush, hovPath);
+                    }
+                }
+
+                // Metin ve Rozetler
+                string title = tabTitles[i];
+                if (i == 1 && flowBadge > 0)
+                {
+                    title += " (" + flowBadge + ")";
+                }
+                else if (i == 2 && notificationBadge > 0)
+                {
+                    title += " (" + notificationBadge + ")";
+                }
+
+                Color textColor = isSelected ? Color.White : (isHovered ? MainForm.ColorText : MainForm.ColorTextMuted);
+                using (Font font = new Font("Segoe UI Emoji", 9.0f, isSelected ? FontStyle.Bold : FontStyle.Regular))
+                using (SolidBrush textBrush = new SolidBrush(textColor))
+                using (StringFormat sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+                {
+                    g.DrawString(title, font, textBrush, tabRect, sf);
+                }
+            }
+        }
+
+        private GraphicsPath CreateRoundedRectanglePath(Rectangle rect, int radius)
+        {
+            GraphicsPath path = new GraphicsPath();
+            int d = radius * 2;
+            path.AddArc(rect.X, rect.Y, d, d, 180, 90);
+            path.AddArc(rect.Right - d, rect.Y, d, d, 270, 90);
+            path.AddArc(rect.Right - d, rect.Bottom - d, d, d, 0, 90);
+            path.AddArc(rect.X, rect.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+    }
+
+    public class MobiFlowPanel : DoubleBufferedPanel
+    {
+        private MobiFlowManager flowManager;
+        private Panel pnlHeader;
+        private Panel pnlBottom;
+        private Panel pnlMessages;
+        private TextBox txtInput;
+        private ModernButton btnSend;
+        private ModernButton btnSendFile;
+        private ModernButton btnOpenFolder;
+        private Label lblTitle;
+        private Label lblStatusDot;
+        private Label lblStatusText;
+        private Label lblDeviceLabel;
+        private ModernComboBox cbDeviceSelect;
+
+        private readonly List<FlowMessageItem> messageHistory = new List<FlowMessageItem>();
+        private readonly List<ConnectedDeviceItem> knownDevices = new List<ConnectedDeviceItem>();
+        private string currentSelectedSerial = null;
+
+        public string SelectedDeviceSerial
+        {
+            get { return currentSelectedSerial; }
+        }
+
+        public MobiFlowPanel(int x, int y, int width, int height, MobiFlowManager manager)
+        {
+            this.flowManager = manager;
+            this.Location = new Point(x, y);
+            this.Size = new Size(width, height);
+            this.BackColor = MainForm.ColorBg;
+            this.AllowDrop = true;
+
+            InitializeUI();
+            this.Resize += delegate { UpdateLayout(); };
+            UpdateLayout();
+        }
+
+        private void InitializeUI()
+        {
+            this.Controls.Clear();
+            int w = this.Width;
+            int h = this.Height;
+
+            // 1. Üst Başlık & Eylemler
+            pnlHeader = new Panel
+            {
+                Location = new Point(0, 0),
+                Size = new Size(w, 42),
+                BackColor = MainForm.ColorCard
+            };
+
+            lblTitle = new Label
+            {
+                Text = L10n.T("💬 MobiDesk Flow", "💬 MobiDesk Flow"),
+                Font = new Font("Segoe UI", 10.0f, FontStyle.Bold),
+                ForeColor = MainForm.ColorText,
+                Location = new Point(12, 10),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblTitle);
+
+            lblStatusDot = new Label
+            {
+                Text = "●",
+                Font = new Font("Segoe UI", 10.0f, FontStyle.Bold),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(lblTitle.Right + 8, 10),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblStatusDot);
+
+            lblStatusText = new Label
+            {
+                Text = L10n.T("Bekleniyor", "Waiting"),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(lblStatusDot.Right + 2, 12),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblStatusText);
+
+            lblDeviceLabel = new Label
+            {
+                Text = L10n.T("Cihaz:", "Device:"),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(lblStatusText.Right + 14, 12),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblDeviceLabel);
+
+            cbDeviceSelect = new ModernComboBox
+            {
+                Location = new Point(lblDeviceLabel.Right + 8, 7),
+                Size = new Size(220, 28)
+            };
+            cbDeviceSelect.SelectedIndexChanged += delegate
+            {
+                ConnectedDeviceItem sel = cbDeviceSelect.SelectedItem as ConnectedDeviceItem;
+                currentSelectedSerial = sel != null ? sel.Serial : null;
+                UpdateStatusDisplay();
+                RebuildMessagesList();
+            };
+            pnlHeader.Controls.Add(cbDeviceSelect);
+
+            btnOpenFolder = new ModernButton(L10n.T("📂 İndirilenler", "📂 Downloads"), w - 140, 7, 130, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
+            btnOpenFolder.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
+            btnOpenFolder.Click += delegate
+            {
+                try { Process.Start("explorer.exe", MobiFlowManager.DownloadsFolder); } catch { }
+            };
+            pnlHeader.Controls.Add(btnOpenFolder);
+            this.Controls.Add(pnlHeader);
+
+            // 2. Alt Mesaj Yazma ve Dosya Gönderme Çubuğu
+            int bottomH = 48;
+            pnlBottom = new Panel
+            {
+                Location = new Point(0, h - bottomH),
+                Size = new Size(w, bottomH),
+                BackColor = MainForm.ColorCard
+            };
+
+            btnSendFile = new ModernButton(L10n.T("📎 Dosya Gönder", "📎 Send File"), 10, 8, 120, 32, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
+            btnSendFile.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+            btnSendFile.Click += delegate
+            {
+                using (OpenFileDialog ofd = new OpenFileDialog { Title = L10n.T("MobiDesk Flow - Gönderilecek Dosyayı Seçin", "MobiDesk Flow - Select File to Send"), Multiselect = true })
+                {
+                    if (ofd.ShowDialog() == DialogResult.OK)
+                    {
+                        foreach (string file in ofd.FileNames)
+                        {
+                            flowManager.SendFile(file, currentSelectedSerial);
+                        }
+                    }
+                }
+            };
+            pnlBottom.Controls.Add(btnSendFile);
+
+            btnSend = new ModernButton(L10n.T("➤ Gönder", "➤ Send"), w - 90, 8, 80, 32, MainForm.ColorPrimary, Color.White, 6);
+            btnSend.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
+            btnSend.Click += delegate { SendCurrentInput(); };
+            pnlBottom.Controls.Add(btnSend);
+
+            txtInput = new TextBox
+            {
+                Location = new Point(140, 11),
+                Size = new Size(Math.Max(100, w - 240), 26),
+                BackColor = MainForm.ColorBg,
+                ForeColor = MainForm.ColorText,
+                Font = new Font("Segoe UI", 10.0f, FontStyle.Regular),
+                BorderStyle = BorderStyle.FixedSingle
+            };
+            txtInput.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.KeyCode == Keys.Enter)
+                {
+                    e.SuppressKeyPress = true;
+                    SendCurrentInput();
+                }
+            };
+            pnlBottom.Controls.Add(txtInput);
+            this.Controls.Add(pnlBottom);
+
+            UpdateHeaderPositions();
+
+            // 3. Orta Mesaj Alanı
+            pnlMessages = new Panel
+            {
+                Location = new Point(0, 44),
+                Size = new Size(w, h - 44 - bottomH - 2),
+                AutoScroll = true,
+                BackColor = MainForm.ColorBg,
+                AllowDrop = true
+            };
+            this.Controls.Add(pnlMessages);
+
+            // Sürükle-Bırak Olayları
+            SetupDragAndDrop(this);
+            SetupDragAndDrop(pnlMessages);
+        }
+
+        public void UpdateDeviceList(List<ConnectedDeviceItem> devices)
+        {
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(delegate { UpdateDeviceList(devices); }));
+                return;
+            }
+
+            knownDevices.Clear();
+            if (devices != null) knownDevices.AddRange(devices);
+
+            string previousSerial = currentSelectedSerial;
+            cbDeviceSelect.Items.Clear();
+
+            int selectedIndexToRestore = -1;
+            for (int i = 0; i < knownDevices.Count; i++)
+            {
+                cbDeviceSelect.Items.Add(knownDevices[i]);
+                if (string.Equals(knownDevices[i].Serial, previousSerial, StringComparison.OrdinalIgnoreCase))
+                {
+                    selectedIndexToRestore = i;
+                }
+            }
+
+            if (cbDeviceSelect.Items.Count > 0)
+            {
+                cbDeviceSelect.SelectedIndex = (selectedIndexToRestore >= 0) ? selectedIndexToRestore : 0;
+                ConnectedDeviceItem sel = cbDeviceSelect.SelectedItem as ConnectedDeviceItem;
+                currentSelectedSerial = sel != null ? sel.Serial : null;
+            }
+            else
+            {
+                currentSelectedSerial = null;
+            }
+
+            UpdateStatusDisplay();
+        }
+
+        public void UpdateDeviceConnection(string serial, bool connected)
+        {
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(delegate { UpdateDeviceConnection(serial, connected); }));
+                return;
+            }
+
+            if (string.Equals(currentSelectedSerial, serial, StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(currentSelectedSerial))
+            {
+                SetConnected(connected);
+            }
+        }
+
+        private void UpdateStatusDisplay()
+        {
+            bool isConn = flowManager != null && flowManager.IsConnected(currentSelectedSerial);
+            SetConnected(isConn);
+        }
+
+        private void UpdateLayout()
+        {
+            int curW = this.ClientSize.Width;
+            int curH = this.ClientSize.Height;
+            if (curW <= 0 || curH <= 0) return;
+
+            int headerH = 42;
+            int bottomH = 48;
+
+            if (pnlHeader != null)
+            {
+                pnlHeader.Location = new Point(0, 0);
+                pnlHeader.Size = new Size(curW, headerH);
+                if (btnOpenFolder != null)
+                {
+                    btnOpenFolder.Location = new Point(curW - 140, 7);
+                }
+            }
+
+            if (pnlBottom != null)
+            {
+                pnlBottom.Location = new Point(0, curH - bottomH);
+                pnlBottom.Size = new Size(curW, bottomH);
+
+                if (btnSendFile != null)
+                {
+                    btnSendFile.Location = new Point(10, 8);
+                }
+
+                if (btnSend != null)
+                {
+                    btnSend.Location = new Point(curW - 90, 8);
+                }
+
+                if (txtInput != null)
+                {
+                    int inputX = 140;
+                    int inputW = Math.Max(100, curW - inputX - 100);
+                    txtInput.Location = new Point(inputX, 11);
+                    txtInput.Size = new Size(inputW, 26);
+                }
+            }
+
+            if (pnlMessages != null)
+            {
+                pnlMessages.Location = new Point(0, headerH + 2);
+                pnlMessages.Size = new Size(curW, Math.Max(50, curH - headerH - bottomH - 4));
+            }
+        }
+
+        private void SetupDragAndDrop(Control c)
+        {
+            c.AllowDrop = true;
+            c.DragEnter += delegate(object s, DragEventArgs e)
+            {
+                if (e.Data.GetDataPresent(DataFormats.FileDrop))
+                {
+                    e.Effect = DragDropEffects.Copy;
+                }
+            };
+            c.DragDrop += delegate(object s, DragEventArgs e)
+            {
+                string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+                if (files != null)
+                {
+                    foreach (string f in files)
+                    {
+                        flowManager.SendFile(f, currentSelectedSerial);
+                    }
+                }
+            };
+        }
+
+        private void SendCurrentInput()
+        {
+            string text = txtInput.Text.Trim();
+            if (string.IsNullOrEmpty(text)) return;
+            txtInput.Text = "";
+            flowManager.SendTextMessage(text, currentSelectedSerial);
+        }
+
+        public void ApplyLanguage()
+        {
+            if (lblTitle != null) lblTitle.Text = L10n.T("💬 MobiDesk Flow", "💬 MobiDesk Flow");
+            if (lblDeviceLabel != null) lblDeviceLabel.Text = L10n.T("Cihaz:", "Device:");
+            if (btnOpenFolder != null) btnOpenFolder.Text = L10n.T("📂 İndirilenler", "📂 Downloads");
+            if (btnSendFile != null) btnSendFile.Text = L10n.T("📎 Dosya Gönder", "📎 Send File");
+            if (btnSend != null) btnSend.Text = L10n.T("➤ Gönder", "➤ Send");
+
+            bool isConn = flowManager != null && flowManager.IsConnected(currentSelectedSerial);
+            SetConnected(isConn);
+            UpdateHeaderPositions();
+            RebuildMessagesList();
+        }
+
+        private void UpdateHeaderPositions()
+        {
+            if (lblTitle == null || lblStatusDot == null || lblStatusText == null || lblDeviceLabel == null || cbDeviceSelect == null) return;
+            lblStatusDot.Location = new Point(lblTitle.Right + 8, 10);
+            lblStatusText.Location = new Point(lblStatusDot.Right + 2, 12);
+            lblDeviceLabel.Location = new Point(lblStatusText.Right + 14, 12);
+            cbDeviceSelect.Location = new Point(lblDeviceLabel.Right + 8, 7);
+        }
+
+        public void SetConnected(bool connected)
+        {
+            if (lblStatusDot != null)
+            {
+                lblStatusDot.ForeColor = connected ? MainForm.ColorSuccess : MainForm.ColorTextMuted;
+                lblStatusText.Text = connected ? L10n.T("Bağlandı", "Connected") : L10n.T("Bekleniyor", "Waiting");
+                lblStatusText.ForeColor = connected ? MainForm.ColorSuccess : MainForm.ColorTextMuted;
+                UpdateHeaderPositions();
+            }
+        }
+
+        public void AddMessage(FlowMessageItem item)
+        {
+            if (pnlMessages == null) return;
+            messageHistory.Add(item);
+
+            // Gelen mesaj başka bir cihazdan ise otomatik olarak o cihaza odaklan
+            if (item.Sender == "mobile" && !string.IsNullOrEmpty(item.DeviceSerial))
+            {
+                if (!string.Equals(currentSelectedSerial, item.DeviceSerial, StringComparison.OrdinalIgnoreCase))
+                {
+                    for (int i = 0; i < knownDevices.Count; i++)
+                    {
+                        if (string.Equals(knownDevices[i].Serial, item.DeviceSerial, StringComparison.OrdinalIgnoreCase))
+                        {
+                            cbDeviceSelect.SelectedIndex = i;
+                            currentSelectedSerial = item.DeviceSerial;
+                            UpdateStatusDisplay();
+                            RebuildMessagesList();
+                            return;
+                        }
+                    }
+                }
+            }
+
+            if (ShouldShowMessage(item))
+            {
+                RenderMessageBubble(item);
+            }
+        }
+
+        private bool ShouldShowMessage(FlowMessageItem item)
+        {
+            if (string.IsNullOrEmpty(currentSelectedSerial)) return true;
+            if (string.Equals(item.DeviceSerial, currentSelectedSerial, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+
+        private void RebuildMessagesList()
+        {
+            if (pnlMessages == null) return;
+            pnlMessages.SuspendLayout();
+            pnlMessages.Controls.Clear();
+
+            foreach (var m in messageHistory)
+            {
+                if (ShouldShowMessage(m))
+                {
+                    RenderMessageBubble(m);
+                }
+            }
+            pnlMessages.ResumeLayout(true);
+        }
+
+        private void RenderMessageBubble(FlowMessageItem item)
+        {
+            bool isMe = (item.Sender == "pc");
+            int panelW = pnlMessages.ClientSize.Width - 24;
+            int bubbleMaxW = Math.Max(260, (int)(panelW * 0.70f));
+
+            Panel bubble = new Panel();
+            bubble.BackColor = isMe ? Color.FromArgb(29, 78, 216) : MainForm.ColorCard;
+            bubble.Padding = new Padding(10, 8, 10, 8);
+            bubble.Tag = item.Id;
+
+            int curY = 6;
+
+            if (knownDevices.Count > 1 && !string.IsNullOrEmpty(item.DeviceName))
+            {
+                Label lblDevBadge = new Label
+                {
+                    Text = (isMe ? "PC ➔ " : "") + item.DeviceName,
+                    Font = new Font("Segoe UI", 7.5f, FontStyle.Bold),
+                    ForeColor = isMe ? Color.FromArgb(191, 219, 254) : MainForm.ColorAccent,
+                    Location = new Point(10, curY),
+                    AutoSize = true
+                };
+                bubble.Controls.Add(lblDevBadge);
+                curY += 16;
+            }
+
+            if (item.IsFile)
+            {
+                Label lblFileName = new Label
+                {
+                    Text = "📁 " + (item.FileName ?? L10n.T("Dosya", "File")),
+                    Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                    ForeColor = Color.White,
+                    Location = new Point(10, curY),
+                    AutoSize = true
+                };
+                bubble.Controls.Add(lblFileName);
+                curY += 20;
+
+                long sizeKb = item.FileSize / 1024;
+                string sizeStr = (sizeKb > 1024) ? string.Format("{0:F1} MB", sizeKb / 1024.0) : sizeKb + " KB";
+                Label lblSize = new Label
+                {
+                    Text = (item.Progress < 100) ? string.Format(L10n.T("Aktarılıyor: %{0} • {1}", "Transferring: %{0} • {1}"), item.Progress, sizeStr) : (L10n.T("Tamamlandı • ", "Completed • ") + sizeStr),
+                    Font = new Font("Segoe UI", 8.0f, FontStyle.Regular),
+                    ForeColor = MainForm.ColorTextMuted,
+                    Location = new Point(10, curY),
+                    AutoSize = true,
+                    Tag = "FILE_STATUS_LABEL"
+                };
+                bubble.Controls.Add(lblSize);
+                curY += 20;
+
+                if (!string.IsNullOrEmpty(item.FilePath))
+                {
+                    LinkLabel lnkOpen = new LinkLabel
+                    {
+                        Text = L10n.T("📂 Klasörde Göster", "📂 Show in Folder"),
+                        Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                        LinkColor = Color.FromArgb(56, 189, 248),
+                        Location = new Point(10, curY),
+                        AutoSize = true
+                    };
+                    string target = item.FilePath;
+                    lnkOpen.LinkClicked += delegate
+                    {
+                        try { Process.Start("explorer.exe", "/select,\"" + target + "\""); } catch { }
+                    };
+                    bubble.Controls.Add(lnkOpen);
+                    curY += 22;
+                }
+            }
+            else
+            {
+                Label lblText = new Label
+                {
+                    Text = item.Text,
+                    Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
+                    ForeColor = Color.White,
+                    Location = new Point(10, curY),
+                    MaximumSize = new Size(bubbleMaxW - 20, 0),
+                    AutoSize = true
+                };
+                bubble.Controls.Add(lblText);
+                curY += lblText.Height + 4;
+
+                if (item.Text != null && (item.Text.StartsWith("http://") || item.Text.StartsWith("https://")))
+                {
+                    LinkLabel lnkUrl = new LinkLabel
+                    {
+                        Text = L10n.T("🌐 Tarayıcıda Aç", "🌐 Open in Browser"),
+                        Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                        LinkColor = Color.FromArgb(56, 189, 248),
+                        Location = new Point(10, curY),
+                        AutoSize = true
+                    };
+                    string url = item.Text;
+                    lnkUrl.LinkClicked += delegate { try { Process.Start(url); } catch { } };
+                    bubble.Controls.Add(lnkUrl);
+                    curY += 20;
+                }
+            }
+
+            Label lblTime = new Label
+            {
+                Text = DateTime.Now.ToString("HH:mm"),
+                Font = new Font("Segoe UI", 7.5f, FontStyle.Regular),
+                ForeColor = Color.FromArgb(160, 203, 213, 225),
+                Location = new Point(10, curY),
+                AutoSize = true
+            };
+            bubble.Controls.Add(lblTime);
+            curY += 18;
+
+            bubble.Size = new Size(bubbleMaxW, curY + 4);
+
+            int lastY = 10;
+            if (pnlMessages.Controls.Count > 0)
+            {
+                Control lastC = pnlMessages.Controls[pnlMessages.Controls.Count - 1];
+                lastY = lastC.Bottom + 10;
+            }
+
+            int bubbleX = isMe ? (panelW - bubble.Width) : 12;
+            bubble.Location = new Point(bubbleX, lastY);
+
+            pnlMessages.Controls.Add(bubble);
+            pnlMessages.ScrollControlIntoView(bubble);
+        }
+
+        public void UpdateFileProgress(FlowMessageItem item)
+        {
+            if (pnlMessages == null) return;
+            foreach (Control c in pnlMessages.Controls)
+            {
+                if (c is Panel && string.Equals(c.Tag as string, item.Id))
+                {
+                    foreach (Control child in c.Controls)
+                    {
+                        if (child is Label && string.Equals(child.Tag as string, "FILE_STATUS_LABEL"))
+                        {
+                            long sizeKb = item.FileSize / 1024;
+                            string sizeStr = (sizeKb > 1024) ? string.Format("{0:F1} MB", sizeKb / 1024.0) : sizeKb + " KB";
+                            child.Text = (item.Progress < 100)
+                                ? string.Format(L10n.T("Aktarılıyor: %{0} • {1}", "Transferring: %{0} • {1}"), item.Progress, sizeStr)
+                                : (L10n.T("Tamamlandı • ", "Completed • ") + sizeStr);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public class MobiNotificationsPanel : DoubleBufferedPanel
+    {
+        private MobiFlowManager flowManager;
+        private Panel pnlHeader;
+        private ModernButton btnClearAll;
+        private Panel pnlNotifsList;
+        private Label lblTitle;
+        private Label lblCount;
+        private Label lblStatusDot;
+        private Label lblStatusText;
+        private Label lblEmptyHint;
+        private Label lblFilterLabel;
+        private ModernComboBox cbDeviceFilter;
+
+        private readonly Dictionary<string, Control> cardMap = new Dictionary<string, Control>();
+        private readonly Dictionary<string, NotificationCardItem> notifItems = new Dictionary<string, NotificationCardItem>();
+        private readonly List<ConnectedDeviceItem> knownDevices = new List<ConnectedDeviceItem>();
+        private string currentFilterSerial = null;
+
+        public MobiNotificationsPanel(int x, int y, int width, int height, MobiFlowManager manager)
+        {
+            this.flowManager = manager;
+            this.Location = new Point(x, y);
+            this.Size = new Size(width, height);
+            this.BackColor = MainForm.ColorBg;
+
+            InitializeUI();
+            this.Resize += delegate { UpdateLayout(); };
+            UpdateLayout();
+        }
+
+        private void InitializeUI()
+        {
+            this.Controls.Clear();
+            int w = this.Width;
+            int h = this.Height;
+
+            // 1. Üst Başlık & Eylemler
+            pnlHeader = new Panel
+            {
+                Location = new Point(0, 0),
+                Size = new Size(w, 42),
+                BackColor = MainForm.ColorCard
+            };
+
+            lblTitle = new Label
+            {
+                Text = L10n.T("🔔 Mobil Bildirim Aynalama", "🔔 Mobile Notification Mirroring"),
+                Font = new Font("Segoe UI", 10.0f, FontStyle.Bold),
+                ForeColor = MainForm.ColorText,
+                Location = new Point(12, 10),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblTitle);
+
+            lblCount = new Label
+            {
+                Text = string.Format("(0 {0})", L10n.T("Bildirim", "Notifications")),
+                Font = new Font("Segoe UI", 9.0f, FontStyle.Regular),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(lblTitle.Right + 8, 11),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblCount);
+
+            lblStatusDot = new Label
+            {
+                Text = "●",
+                Font = new Font("Segoe UI", 10.0f, FontStyle.Bold),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(lblCount.Right + 10, 10),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblStatusDot);
+
+            lblStatusText = new Label
+            {
+                Text = L10n.T("Bekleniyor", "Waiting"),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(lblStatusDot.Right + 2, 12),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblStatusText);
+
+            lblFilterLabel = new Label
+            {
+                Text = L10n.T("Filtrele:", "Filter:"),
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(lblStatusText.Right + 12, 12),
+                AutoSize = true
+            };
+            pnlHeader.Controls.Add(lblFilterLabel);
+
+            cbDeviceFilter = new ModernComboBox
+            {
+                Location = new Point(lblFilterLabel.Right + 8, 7),
+                Size = new Size(200, 28)
+            };
+            cbDeviceFilter.Items.Add(L10n.T("🌐 Tüm Cihazlar", "🌐 All Devices"));
+            cbDeviceFilter.SelectedIndex = 0;
+            cbDeviceFilter.SelectedIndexChanged += delegate
+            {
+                if (cbDeviceFilter.SelectedIndex <= 0)
+                {
+                    currentFilterSerial = null;
+                }
+                else
+                {
+                    ConnectedDeviceItem sel = cbDeviceFilter.SelectedItem as ConnectedDeviceItem;
+                    currentFilterSerial = sel != null ? sel.Serial : null;
+                }
+                ApplyFilter();
+            };
+            pnlHeader.Controls.Add(cbDeviceFilter);
+
+            btnClearAll = new ModernButton(L10n.T("🗑️ Tümünü Temizle", "🗑️ Clear All"), w - 150, 7, 138, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
+            btnClearAll.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
+            btnClearAll.Click += delegate
+            {
+                cardMap.Clear();
+                notifItems.Clear();
+                pnlNotifsList.Controls.Clear();
+                pnlNotifsList.Controls.Add(lblEmptyHint);
+                lblEmptyHint.Visible = true;
+                UpdateCount();
+            };
+            pnlHeader.Controls.Add(btnClearAll);
+            this.Controls.Add(pnlHeader);
+
+            // 2. Bildirimler Listesi
+            pnlNotifsList = new Panel
+            {
+                Location = new Point(0, 44),
+                Size = new Size(w, h - 46),
+                AutoScroll = true,
+                BackColor = MainForm.ColorBg
+            };
+
+            lblEmptyHint = new Label
+            {
+                Text = L10n.T(
+                    "🔔 Henüz yeni bir bildirim yok\n\nTablet veya telefonunuza gelen bildirimler burada anlık olarak görünecektir.\n(Cihazınızda MobiDesk Bildirim İzninin açık olduğundan emin olun.)",
+                    "🔔 No new notifications yet\n\nNotifications from your tablet or phone will appear here in real time.\n(Make sure MobiDesk Notification Access is enabled on your device.)"
+                ),
+                Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
+                ForeColor = MainForm.ColorTextMuted,
+                TextAlign = ContentAlignment.MiddleCenter,
+                Size = new Size(Math.Max(200, w - 40), 120),
+                Location = new Point(20, 60),
+                Visible = true
+            };
+            pnlNotifsList.Controls.Add(lblEmptyHint);
+            this.Controls.Add(pnlNotifsList);
+
+            UpdateHeaderPositions();
+        }
+
+        public void ApplyLanguage()
+        {
+            if (lblTitle != null) lblTitle.Text = L10n.T("🔔 Mobil Bildirim Aynalama", "🔔 Mobile Notification Mirroring");
+            if (lblFilterLabel != null) lblFilterLabel.Text = L10n.T("Filtrele:", "Filter:");
+            if (btnClearAll != null) btnClearAll.Text = L10n.T("🗑️ Tümünü Temizle", "🗑️ Clear All");
+            if (lblEmptyHint != null)
+            {
+                lblEmptyHint.Text = L10n.T(
+                    "🔔 Henüz yeni bir bildirim yok\n\nTablet veya telefonunuza gelen bildirimler burada anlık olarak görünecektir.\n(Cihazınızda MobiDesk Bildirim İzninin açık olduğundan emin olun.)",
+                    "🔔 No new notifications yet\n\nNotifications from your tablet or phone will appear here in real time.\n(Make sure MobiDesk Notification Access is enabled on your device.)"
+                );
+            }
+            if (cbDeviceFilter != null && cbDeviceFilter.Items.Count > 0)
+            {
+                cbDeviceFilter.Items[0] = L10n.T("🌐 Tüm Cihazlar", "🌐 All Devices");
+                cbDeviceFilter.Invalidate();
+            }
+            foreach (var card in cardMap.Values)
+            {
+                foreach (Control child in card.Controls)
+                {
+                    if (child is ModernButton && string.Equals(child.Tag as string, "BTN_DISMISS"))
+                    {
+                        child.Text = L10n.T("✕ Kapat", "✕ Dismiss");
+                    }
+                }
+            }
+            bool isConn = flowManager != null && flowManager.IsConnected();
+            SetConnected(isConn);
+            UpdateCount();
+            UpdateHeaderPositions();
+        }
+
+        private void UpdateHeaderPositions()
+        {
+            if (lblTitle == null || lblCount == null || lblStatusDot == null || lblStatusText == null || lblFilterLabel == null || cbDeviceFilter == null) return;
+            lblCount.Location = new Point(lblTitle.Right + 8, 11);
+            lblStatusDot.Location = new Point(lblCount.Right + 10, 10);
+            lblStatusText.Location = new Point(lblStatusDot.Right + 2, 12);
+            lblFilterLabel.Location = new Point(lblStatusText.Right + 12, 12);
+            cbDeviceFilter.Location = new Point(lblFilterLabel.Right + 8, 7);
+        }
+
+        public void UpdateDeviceList(List<ConnectedDeviceItem> devices)
+        {
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(delegate { UpdateDeviceList(devices); }));
+                return;
+            }
+
+            knownDevices.Clear();
+            if (devices != null) knownDevices.AddRange(devices);
+
+            string prevFilter = currentFilterSerial;
+            cbDeviceFilter.Items.Clear();
+            cbDeviceFilter.Items.Add(L10n.T("🌐 Tüm Cihazlar", "🌐 All Devices"));
+
+            int restoreIdx = 0;
+            for (int i = 0; i < knownDevices.Count; i++)
+            {
+                cbDeviceFilter.Items.Add(knownDevices[i]);
+                if (string.Equals(knownDevices[i].Serial, prevFilter, StringComparison.OrdinalIgnoreCase))
+                {
+                    restoreIdx = i + 1;
+                }
+            }
+
+            cbDeviceFilter.SelectedIndex = restoreIdx;
+            ApplyFilter();
+        }
+
+        public void UpdateDeviceConnection(string serial, bool connected)
+        {
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action(delegate { UpdateDeviceConnection(serial, connected); }));
+                return;
+            }
+
+            if (flowManager != null)
+            {
+                SetConnected(flowManager.IsConnected());
+            }
+        }
+
+        private void ApplyFilter()
+        {
+            pnlNotifsList.SuspendLayout();
+            foreach (var kvp in cardMap)
+            {
+                string key = kvp.Key;
+                Control card = kvp.Value;
+                NotificationCardItem item;
+                if (notifItems.TryGetValue(key, out item))
+                {
+                    bool visible = string.IsNullOrEmpty(currentFilterSerial) ||
+                                   string.Equals(item.DeviceSerial, currentFilterSerial, StringComparison.OrdinalIgnoreCase);
+                    card.Visible = visible;
+                }
+            }
+            RearrangeCards();
+            pnlNotifsList.ResumeLayout(true);
+            UpdateCount();
+        }
+
+        private void UpdateLayout()
+        {
+            int curW = this.ClientSize.Width;
+            int curH = this.ClientSize.Height;
+            if (curW <= 0 || curH <= 0) return;
+
+            int headerH = 42;
+            if (pnlHeader != null)
+            {
+                pnlHeader.Location = new Point(0, 0);
+                pnlHeader.Size = new Size(curW, headerH);
+                if (btnClearAll != null)
+                {
+                    btnClearAll.Location = new Point(curW - 148, 7);
+                }
+            }
+
+            if (pnlNotifsList != null)
+            {
+                pnlNotifsList.Location = new Point(0, headerH + 2);
+                pnlNotifsList.Size = new Size(curW, Math.Max(50, curH - headerH - 4));
+                if (lblEmptyHint != null)
+                {
+                    lblEmptyHint.Size = new Size(Math.Max(200, curW - 40), 120);
+                }
+            }
+        }
+
+        public void SetConnected(bool connected)
+        {
+            if (lblStatusDot != null)
+            {
+                lblStatusDot.ForeColor = connected ? MainForm.ColorSuccess : MainForm.ColorTextMuted;
+                lblStatusText.Text = connected ? L10n.T("Bağlandı", "Connected") : L10n.T("Bekleniyor", "Waiting");
+                lblStatusText.ForeColor = connected ? MainForm.ColorSuccess : MainForm.ColorTextMuted;
+                UpdateHeaderPositions();
+            }
+        }
+
+        public void AddNotification(NotificationCardItem item)
+        {
+            if (pnlNotifsList == null) return;
+            lblEmptyHint.Visible = false;
+
+            if (cardMap.ContainsKey(item.Key))
+            {
+                RemoveNotification(item.Key);
+            }
+
+            notifItems[item.Key] = item;
+
+            int cardW = pnlNotifsList.ClientSize.Width - 24;
+            Panel card = new Panel
+            {
+                Size = new Size(cardW, 72),
+                BackColor = MainForm.ColorCard,
+                Padding = new Padding(12, 8, 12, 8),
+                Tag = item
+            };
+
+            // İkon
+            PictureBox pbIcon = new PictureBox
+            {
+                Size = new Size(36, 36),
+                Location = new Point(12, 18),
+                SizeMode = PictureBoxSizeMode.Zoom
+            };
+            if (item.CachedIcon != null)
+            {
+                pbIcon.Image = item.CachedIcon;
+            }
+            else
+            {
+                Bitmap bmp = new Bitmap(36, 36);
+                using (Graphics g = Graphics.FromImage(bmp))
+                {
+                    g.Clear(Color.FromArgb(28, 38, 58));
+                    using (Font f = new Font("Segoe UI Emoji", 12.0f, FontStyle.Regular))
+                    {
+                        g.DrawString("🔔", f, Brushes.White, 4, 4);
+                    }
+                }
+                pbIcon.Image = bmp;
+            }
+            card.Controls.Add(pbIcon);
+
+            // Bilgi
+            int textW = cardW - 60 - 80;
+            string devTag = !string.IsNullOrEmpty(item.DeviceName) ? ("  •  [" + item.DeviceName + "]") : "";
+            Label lblApp = new Label
+            {
+                Text = item.AppName + devTag + "  •  " + DateTime.Now.ToString("HH:mm"),
+                Font = new Font("Segoe UI", 8.0f, FontStyle.Bold),
+                ForeColor = MainForm.ColorAccent,
+                Location = new Point(56, 8),
+                AutoSize = true
+            };
+            card.Controls.Add(lblApp);
+
+            Label lblTitle = new Label
+            {
+                Text = item.Title,
+                Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
+                ForeColor = Color.White,
+                Location = new Point(56, 26),
+                Size = new Size(textW, 18)
+            };
+            card.Controls.Add(lblTitle);
+
+            Label lblBody = new Label
+            {
+                Text = item.Text,
+                Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
+                ForeColor = MainForm.ColorTextMuted,
+                Location = new Point(56, 46),
+                Size = new Size(textW, 18)
+            };
+            card.Controls.Add(lblBody);
+
+            // Kapat (Dismiss) Butonu
+            ModernButton btnDismiss = new ModernButton(L10n.T("✕ Kapat", "✕ Dismiss"), cardW - 74, 20, 64, 28, Color.FromArgb(28, 38, 58), MainForm.ColorTextMuted, 5);
+            btnDismiss.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
+            btnDismiss.Tag = "BTN_DISMISS";
+            btnDismiss.Click += delegate
+            {
+                flowManager.DismissNotification(item.PackageName, item.Id, item.Key, item.DeviceSerial);
+                RemoveNotification(item.Key);
+            };
+            card.Controls.Add(btnDismiss);
+
+            cardMap[item.Key] = card;
+
+            bool isVisible = string.IsNullOrEmpty(currentFilterSerial) ||
+                             string.Equals(item.DeviceSerial, currentFilterSerial, StringComparison.OrdinalIgnoreCase);
+            card.Visible = isVisible;
+
+            pnlNotifsList.Controls.Add(card);
+            RearrangeCards();
+            UpdateCount();
+        }
+
+        public void RemoveNotification(string key)
+        {
+            if (pnlNotifsList == null) return;
+            Control c;
+            if (cardMap.TryGetValue(key, out c))
+            {
+                cardMap.Remove(key);
+                notifItems.Remove(key);
+                pnlNotifsList.Controls.Remove(c);
+                c.Dispose();
+                RearrangeCards();
+                UpdateCount();
+            }
+        }
+
+        private void RearrangeCards()
+        {
+            int curY = 10;
+            int visibleCount = 0;
+            foreach (Control c in pnlNotifsList.Controls)
+            {
+                if (c == lblEmptyHint || !c.Visible) continue;
+                c.Location = new Point(12, curY);
+                curY += c.Height + 8;
+                visibleCount++;
+            }
+            if (visibleCount == 0)
+            {
+                lblEmptyHint.Visible = true;
+            }
+            else
+            {
+                lblEmptyHint.Visible = false;
+            }
+        }
+
+        private void UpdateCount()
+        {
+            if (lblCount != null)
+            {
+                int count = 0;
+                foreach (var c in cardMap.Values)
+                {
+                    if (c.Visible) count++;
+                }
+                lblCount.Text = string.Format("({0} {1})", count, L10n.T("Bildirim", "Notifications"));
+                UpdateHeaderPositions();
+            }
         }
     }
 }
