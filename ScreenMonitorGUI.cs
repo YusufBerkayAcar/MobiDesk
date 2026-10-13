@@ -2636,6 +2636,10 @@ namespace ScreenMonitoringApp
                             {
                                 HandleDeviceInfo(line);
                             }
+                            else if (line.StartsWith("FPS_STATE"))
+                            {
+                                HandleFpsStateFromClient(line);
+                            }
                             else
                             {
                                 ProcessTouchCommand(line);
@@ -2969,6 +2973,35 @@ namespace ScreenMonitoringApp
                 }
             }
             catch { }
+        }
+
+        private void HandleFpsStateFromClient(string line)
+        {
+            try
+            {
+                string[] parts = line.Split(' ');
+                if (parts.Length >= 2)
+                {
+                    bool isEnabled = (parts[1] == "1" || parts[1].Equals("true", StringComparison.OrdinalIgnoreCase));
+                    this.BeginInvoke(new Action(delegate()
+                    {
+                        showFpsOnTablet = isEnabled;
+                        AppConfig.ShowFps = isEnabled;
+                        AppConfig.Save();
+
+                        if (swShowFps != null && swShowFps.Checked != isEnabled)
+                        {
+                            swShowFps.Checked = isEnabled;
+                        }
+
+                        Program.Log(string.Format("FPS counter state synced from mobile client: enabled={0}", isEnabled));
+                    }));
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.Log("HandleFpsStateFromClient error: " + ex.Message);
+            }
         }
 
         private void ProcessTouchCommand(string line)

@@ -79,12 +79,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun setupTouchEvents() {
         surfaceView.setOnTouchListener { _, event ->
+            val dp = resources.displayMetrics.density.coerceAtLeast(1.0f)
             if (event.actionMasked == MotionEvent.ACTION_DOWN) {
-                if (event.x < 300f && event.y < 120f) {
+                // Sol üst köşe çift dokunma alanı (DPI duyarlı)
+                if (event.x < 140f * dp && event.y < 80f * dp) {
                     val now = System.currentTimeMillis()
                     if (now - lastTapTime < 400) {
                         showFpsCounter = !showFpsCounter
                         lastTapTime = 0L
+                        sendFpsStatePacket(showFpsCounter)
+                        return@setOnTouchListener true
                     } else {
                         lastTapTime = now
                     }
@@ -110,6 +114,24 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
             true
         }
+    }
+
+    private fun sendFpsStatePacket(enabled: Boolean) {
+        Thread {
+            try {
+                synchronized(socketLock) {
+                    val out = outputStream
+                    if (out != null) {
+                        val state = if (enabled) 1 else 0
+                        val msg = "FPS_STATE $state\n"
+                        out.write(msg.toByteArray(Charsets.US_ASCII))
+                        out.flush()
+                        android.util.Log.i("TabletStream", "Sent FPS_STATE $state to PC")
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }.start()
     }
 
     private fun sendTouchPacket(action: String, x: Float, y: Float) {
