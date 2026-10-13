@@ -25,6 +25,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private var activeSocket: Socket? = null
     private val socketLock = Any()
 
+    private var serverWorker: NetworkServerWorker? = null
     private var surfaceWidth = 1280
     private var surfaceHeight = 800
 
@@ -41,7 +42,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         surfaceView = SurfaceView(this)
-        surfaceView.holder.setFormat(PixelFormat.RGB_565)
+        surfaceView.holder.setFormat(PixelFormat.RGBA_8888)
         surfaceView.holder.addCallback(this)
         setContentView(surfaceView)
 
@@ -129,7 +130,9 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         isRunning.set(true)
-        serverThread = Thread(NetworkServerWorker(holder)).apply { start() }
+        val worker = NetworkServerWorker(holder)
+        serverWorker = worker
+        serverThread = Thread(worker).apply { start() }
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
@@ -139,6 +142,8 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         isRunning.set(false)
+        serverWorker?.stopStandby()
+        serverWorker = null
         synchronized(socketLock) {
             outputStream = null
             try { activeSocket?.close() } catch (_: Exception) {}
@@ -160,11 +165,120 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             typeface = Typeface.DEFAULT_BOLD
             setShadowLayer(4f, 2f, 2f, Color.BLACK)
         }
-        private val statusPaint = Paint().apply {
-            color = Color.rgb(18, 18, 24)
-        }
         private val dstRect = Rect()
         private var fpsText = "0 FPS"
+
+        // --- Modern Standby Screen Renderer State & Paints ---
+        private val isStandbyActive = AtomicBoolean(false)
+        private var standbyThread: Thread? = null
+
+        private var cachedWifiIp: String = ""
+        private var lastWifiIpCheckTime: Long = 0L
+
+        private val sbBgPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG)
+        private val sbGridDotPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.DITHER_FLAG).apply {
+            color = Color.argb(12, 148, 163, 184)
+            style = Paint.Style.FILL
+        }
+        private val sbGlowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val sbWavePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+        private val sbCardBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val sbCardBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+        private val sbBadgeBgPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val sbBadgeBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.STROKE
+        }
+        private val sbTextBold = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        private val sbTextRegular = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val sbVectorPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+        private val sbRectF = RectF()
+        private val sbRectF2 = RectF()
+
+        fun stopStandby() {
+            stopStandbyAnimation()
+        }
+
+        private fun startStandbyAnimation(errorMsg: String? = null) {
+            if (isStandbyActive.getAndSet(true)) return
+            standbyThread = Thread {
+                var animPhase = 0f
+                while (isStandbyActive.get() && isRunning.get()) {
+                    val canvas = try {
+                        lockCanvasCompat()
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (canvas != null) {
+                        try {
+                            drawModernStandbyScreen(canvas, animPhase, errorMsg)
+                        } catch (_: Exception) {
+                        } finally {
+                            try {
+                                holder.unlockCanvasAndPost(canvas)
+                            } catch (_: Exception) {
+                            }
+                        }
+                    }
+                    animPhase += 0.05f
+                    if (animPhase > 1000f) animPhase = 0f
+                    try {
+                        Thread.sleep(40) // ~25 FPS akıcı nabız animasyonu
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            }.apply {
+                name = "StandbyAnimationThread"
+                priority = Thread.MIN_PRIORITY + 1
+                start()
+            }
+        }
+
+        private fun stopStandbyAnimation() {
+            isStandbyActive.set(false)
+            val thread = standbyThread
+            if (thread != null) {
+                thread.interrupt()
+                try {
+                    thread.join(250)
+                } catch (_: Exception) {
+                }
+                standbyThread = null
+            }
+        }
+
+        private fun updateWifiIpAddress() {
+            val now = System.currentTimeMillis()
+            if (now - lastWifiIpCheckTime < 4000 && cachedWifiIp.isNotEmpty()) return
+            lastWifiIpCheckTime = now
+            try {
+                val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
+                if (interfaces != null) {
+                    while (interfaces.hasMoreElements()) {
+                        val iface = interfaces.nextElement()
+                        if (iface.isLoopback || !iface.isUp) continue
+                        val addrs = iface.inetAddresses
+                        while (addrs.hasMoreElements()) {
+                            val addr = addrs.nextElement()
+                            if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
+                                val host = addr.hostAddress
+                                if (host != null && !host.startsWith("127.")) {
+                                    cachedWifiIp = host
+                                    return
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {}
+            cachedWifiIp = ""
+        }
 
         private fun lockCanvasCompat(): Canvas? {
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -185,22 +299,18 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
                 server.bind(java.net.InetSocketAddress(55555))
                 serverSocket = server
             } catch (e: Exception) {
-                drawStatusMessage("Soket Başlatılamadı", "Port 55555 kullanılamıyor: ${e.message}")
+                startStandbyAnimation("Port 55555 kullanılamıyor: ${e.message}")
                 return
             }
 
             while (isRunning.get() && serverSocket?.isClosed == false) {
                 var socket: Socket? = null
                 try {
-                    try {
-                        drawStatusMessage(
-                            "Bağlantı Bekleniyor...",
-                            "PC'de MobiDesk başlatıldığında ekran otomatik açılacaktır"
-                        )
-                    } catch (_: Exception) {
-                    }
+                    startStandbyAnimation()
 
                     socket = serverSocket!!.accept()
+                    stopStandbyAnimation()
+
                     socket.tcpNoDelay = true
                     socket.receiveBufferSize = 64 * 1024
 
@@ -528,44 +638,359 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             }
         }
 
-        private fun drawStatusMessage(title: String, subtitle: String) {
-            val canvas = try {
-                lockCanvasCompat()
-            } catch (_: Exception) {
-                null
-            } ?: return
+        private fun drawModernStandbyScreen(canvas: Canvas, phase: Float, errorMsg: String?) {
+            val w = if (canvas.width > 0) canvas.width.toFloat() else surfaceWidth.toFloat()
+            val h = if (canvas.height > 0) canvas.height.toFloat() else surfaceHeight.toFloat()
+            if (w <= 0f || h <= 0f) return
 
+            val metrics = resources.displayMetrics
+            val dp = metrics.density.coerceAtLeast(1.0f)
+            val sp = (dp * (h / (480f * dp)).coerceIn(0.95f, 1.45f)).coerceAtLeast(1.35f)
+
+            val padX = 28f * dp
+            val padY = 16f * dp
+            val logoSize = 44f * dp
+            val topBarBottom = padY + logoSize
+
+            // 1. Dinamik İçerik Boyutlu Kablolu Bağlantı ve USB Hata Ayıklama Kartı (Ön Hesaplama)
+            // A) Metin genişliklerini dinamik olarak ölç
+            sbTextRegular.textSize = 11.2f * sp
+            val t1W = sbTextRegular.measureText("• Cihazı USB kablosu ile bilgisayara bağlayın")
+            val t2W = sbTextRegular.measureText("• MobiDesk PC uygulaması ADB tünelini otomatik kurar")
+            val t3W = sbTextRegular.measureText("• 60 FPS donanım hızlandırmalı sıfır gecikme ve şarj desteği")
+            val maxSolTextW = maxOf(t1W, t2W, t3W)
+
+            sbTextRegular.textSize = 11.2f * sp
+            val b1W = sbTextRegular.measureText("1. Cihaz Ayarları > Geliştirici Seçenekleri menüsüne gidin")
+            sbTextBold.textSize = 11.2f * sp
+            val b2W = sbTextBold.measureText("2. \"USB Hata Ayıklama\" (USB Debugging) seçeneğini AÇIN")
+            sbTextRegular.textSize = 9.8f * sp
+            val b3W = sbTextRegular.measureText("(Menü yoksa: Ayarlar > Cihaz Hakkında > 'Yapım Numarası'na 7 kez dokunun)")
+            val maxSagTextW = maxOf(b1W, b2W, b3W)
+
+            // B) Kolon ve Kart Genişliği Hesaplaması (Yazıların uzunluğuna tam uyumlu)
+            val colGap = 16f * dp
+            val cardPadX = 18f * dp
+            val neededColW = maxOf(maxSolTextW + 18f * dp, maxSagTextW + 30f * dp)
+
+            val maxAllowedCardW = w - padX * 2f
+            val idealCardW = neededColW * 2f + colGap + cardPadX * 2f
+            val cardW = idealCardW.coerceIn(280f * dp, maxAllowedCardW)
+            val cardLeft = (w - cardW) / 2f
+            val cardRadius = 12f * dp
+
+            val colW = (cardW - cardPadX * 2f - colGap) / 2f
+            val col1L = cardLeft + cardPadX
+            val col2L = col1L + colW + colGap
+
+            // C) Kart Yüksekliği ve Konumlandırma (Metin satırlarıyla tam orantılı, alt bilgiye yapışmayan temiz boşluk)
+            val neededContentH = 44f * dp + 86f * sp
+            val cardH = neededContentH.coerceIn(145f * dp, h * 0.42f)
+
+            // Alt bilgi çubuğuna yapışmaması için temiz alt boşluk (38dp margin)
+            val cardBottom = h - 38f * dp
+            val cardTop = cardBottom - cardH
+
+            // 2. Merkez Hub Dikey Konumlandırma ("Bilgisayarınız Bekleniyor" ekrana tam ortalı)
+            val centerX = w / 2f
+            val availableMidH = (cardTop - topBarBottom).coerceAtLeast(120f)
+            val hubCenterY = topBarBottom + availableMidH * 0.46f
+            val radarY = hubCenterY - (22f * dp + 12f * sp)
+
+            // 3. Zemin: Derin uzay stüdyo tonu (#090D16) & Pürüzsüz Degrade
+            canvas.drawColor(Color.rgb(9, 13, 22))
+
+            // A) Yumuşak, kadifemsi merkez aydınlatması (Bantlaşma ve kesilmeyi önleyen çok kademeli yumuşak geçiş)
             try {
-                canvas.drawRect(0f, 0f, surfaceWidth.toFloat(), surfaceHeight.toFloat(), statusPaint)
+                val glowRadius = (minOf(w, h) * 0.58f).coerceAtLeast(180f * dp)
+                val radialShader = RadialGradient(
+                    centerX, radarY, glowRadius,
+                    intArrayOf(
+                        Color.argb(55, 14, 165, 233),
+                        Color.argb(32, 56, 189, 248),
+                        Color.argb(16, 99, 102, 241),
+                        Color.argb(6, 30, 41, 59),
+                        Color.TRANSPARENT
+                    ),
+                    floatArrayOf(0f, 0.28f, 0.58f, 0.82f, 1f),
+                    Shader.TileMode.CLAMP
+                )
+                sbBgPaint.shader = radialShader
+                canvas.drawCircle(centerX, radarY, glowRadius, sbBgPaint)
+                sbBgPaint.shader = null
+            } catch (_: Exception) {}
 
-                val x = surfaceWidth / 2f
-                val y = surfaceHeight / 2f
-
-                val titlePaint = Paint().apply {
-                    color = Color.WHITE
-                    textAlign = Paint.Align.CENTER
-                    textSize = 42f
-                    typeface = Typeface.DEFAULT_BOLD
-                    isAntiAlias = true
-                    setShadowLayer(4f, 2f, 2f, Color.BLACK)
+            // B) Pürüzsüz, yumuşak anti-aliased grid mikro-noktaları (Tablette kesik/pikselleşmiş görünümü engeller)
+            val dotStep = 48f * dp
+            var px = dotStep / 2f
+            while (px < w) {
+                var py = dotStep / 2f
+                while (py < h) {
+                    canvas.drawCircle(px, py, 1.1f * dp, sbGridDotPaint)
+                    py += dotStep
                 }
-                val subPaint = Paint().apply {
-                    color = Color.LTGRAY
-                    textAlign = Paint.Align.CENTER
-                    textSize = 24f
-                    typeface = Typeface.DEFAULT
-                    isAntiAlias = true
-                    setShadowLayer(3f, 1f, 1f, Color.BLACK)
-                }
-
-                canvas.drawText(title, x, y - 20f, titlePaint)
-                canvas.drawText(subtitle, x, y + 40f, subPaint)
-            } finally {
-                try {
-                    holder.unlockCanvasAndPost(canvas)
-                } catch (_: Exception) {
-                }
+                px += dotStep
             }
+
+            // 4. Üst Bar (Header Bar)
+            // A) Logo Rozeti (Gelişmiş Vektör İkon Kutusu)
+            sbRectF.set(padX, padY, padX + logoSize, padY + logoSize)
+
+            sbCardBgPaint.color = Color.rgb(17, 26, 44)
+            canvas.drawRoundRect(sbRectF, 10f * dp, 10f * dp, sbCardBgPaint)
+
+            sbCardBorderPaint.color = Color.rgb(14, 165, 233)
+            sbCardBorderPaint.strokeWidth = 1.6f * dp
+            canvas.drawRoundRect(sbRectF, 10f * dp, 10f * dp, sbCardBorderPaint)
+
+            // Vektör Çift Monitör İkonu (Kutu içinde tam ortalanmış)
+            val lBoxCx = padX + logoSize / 2f
+            val lBoxCy = padY + logoSize / 2f
+
+            sbVectorPaint.color = Color.rgb(56, 189, 248)
+            sbVectorPaint.style = Paint.Style.STROKE
+            sbVectorPaint.strokeWidth = 1.8f * dp
+
+            val monW = 16f * dp
+            val monH = 12f * dp
+            val monL = lBoxCx - monW / 2f - 3f * dp
+            val monT = lBoxCy - monH / 2f - 2f * dp
+            sbRectF2.set(monL, monT, monL + monW, monT + monH)
+            canvas.drawRoundRect(sbRectF2, 2.5f * dp, 2.5f * dp, sbVectorPaint)
+
+            sbVectorPaint.color = Color.rgb(99, 102, 241)
+            val mon2L = monL + 8f * dp
+            val mon2T = monT + 3f * dp
+            sbRectF2.set(mon2L, mon2T, mon2L + 14f * dp, mon2T + 12f * dp)
+            canvas.drawRoundRect(sbRectF2, 2f * dp, 2f * dp, sbVectorPaint)
+
+            sbVectorPaint.color = Color.rgb(148, 163, 184)
+            sbVectorPaint.strokeWidth = 1.4f * dp
+            canvas.drawLine(monL + 8f * dp, monT + monH, monL + 8f * dp, monT + monH + 4f * dp, sbVectorPaint)
+            canvas.drawLine(monL + 4f * dp, monT + monH + 4f * dp, monL + 12f * dp, monT + monH + 4f * dp, sbVectorPaint)
+
+            // B) Marka Başlığı (Beta etiketiyle)
+            val titleX = padX + logoSize + 12f * dp
+            sbTextBold.textSize = 16f * sp
+            sbTextBold.color = Color.WHITE
+            sbTextBold.textAlign = Paint.Align.LEFT
+            canvas.drawText("MobiDesk ", titleX, padY + 20f * dp, sbTextBold)
+
+            val mobiW = sbTextBold.measureText("MobiDesk ")
+            sbTextBold.color = Color.rgb(56, 189, 248)
+            canvas.drawText("STUDIO ", titleX + mobiW, padY + 20f * dp, sbTextBold)
+
+            val studioW = sbTextBold.measureText("STUDIO ")
+            sbTextBold.textSize = 11.5f * sp
+            sbTextBold.color = Color.rgb(244, 114, 182) // Şık pembe/mor Beta rozeti
+            canvas.drawText("(Beta)", titleX + mobiW + studioW, padY + 18.5f * dp, sbTextBold)
+
+            sbTextRegular.textSize = 10.5f * sp
+            sbTextRegular.color = Color.rgb(148, 163, 184)
+            sbTextRegular.textAlign = Paint.Align.LEFT
+            canvas.drawText("Yüksek Hızlı İkinci Ekran Alıcısı (Receiver)", titleX, padY + 38f * dp, sbTextRegular)
+
+            // C) Sağ Üst Cihaz & Donanım Rozeti (Hap)
+            val modelStr = (Build.MODEL ?: "Cihaz").replace("_", " ")
+            val specStr = "📱 $modelStr  •  ${canvas.width}×${canvas.height}  •  ${resources.displayMetrics.densityDpi} DPI"
+            sbTextRegular.textSize = 10.5f * sp
+            sbTextRegular.color = Color.rgb(203, 213, 225)
+            val specW = sbTextRegular.measureText(specStr)
+            val pillW = specW + 24f * dp
+            val pillH = 30f * dp
+            val pillL = w - padX - pillW
+            val pillT = padY + 6f * dp
+            sbRectF.set(pillL, pillT, pillL + pillW, pillT + pillH)
+
+            sbBadgeBgPaint.color = Color.rgb(15, 23, 42)
+            canvas.drawRoundRect(sbRectF, pillH / 2f, pillH / 2f, sbBadgeBgPaint)
+
+            sbBadgeBorderPaint.color = Color.rgb(30, 41, 59)
+            sbBadgeBorderPaint.strokeWidth = 1.2f * dp
+            canvas.drawRoundRect(sbRectF, pillH / 2f, pillH / 2f, sbBadgeBorderPaint)
+
+            canvas.drawText(specStr, pillL + 12f * dp, pillT + 19.5f * dp, sbTextRegular)
+
+            // 5. Merkez Hub (Radar Nabzı, Durum Kapsülü, Büyük Başlık)
+            val isError = errorMsg != null
+            val mainAccent = if (isError) Color.rgb(239, 68, 68) else Color.rgb(16, 185, 129)
+            val subAccent = if (isError) Color.rgb(248, 113, 113) else Color.rgb(110, 231, 183)
+
+            if (!isError) {
+                // Radar Dalgası 1
+                val wave1 = (phase * 16f) % 46f
+                val r1 = (16f + wave1) * dp
+                val a1 = ((1f - wave1 / 46f) * 150f).toInt().coerceIn(0, 255)
+                sbWavePaint.color = Color.argb(a1, 16, 185, 129)
+                sbWavePaint.strokeWidth = 1.8f * dp
+                canvas.drawCircle(centerX, radarY, r1, sbWavePaint)
+
+                // Radar Dalgası 2
+                val wave2 = (phase * 16f + 23f) % 46f
+                val r2 = (16f + wave2) * dp
+                val a2 = ((1f - wave2 / 46f) * 150f).toInt().coerceIn(0, 255)
+                sbWavePaint.color = Color.argb(a2, 16, 185, 129)
+                sbWavePaint.strokeWidth = 1.8f * dp
+                canvas.drawCircle(centerX, radarY, r2, sbWavePaint)
+            }
+
+            // Merkez Işıltı Dairesi
+            sbGlowPaint.color = Color.argb(45, Color.red(mainAccent), Color.green(mainAccent), Color.blue(mainAccent))
+            canvas.drawCircle(centerX, radarY, 22f * dp, sbGlowPaint)
+
+            // Merkez Katı Çekirdek
+            sbGlowPaint.color = mainAccent
+            canvas.drawCircle(centerX, radarY, 10f * dp, sbGlowPaint)
+
+            // Çekirdek Merkez Parlaması
+            sbGlowPaint.color = Color.WHITE
+            canvas.drawCircle(centerX, radarY, 3.5f * dp, sbGlowPaint)
+
+            // Durum Hapı (Status Pill)
+            val statusText = if (isError) "⚠️  PORT BAŞLATILAMADI" else "●  HAZIR • BAĞLANTI BEKLENİYOR"
+            sbTextBold.textSize = 11f * sp
+            sbTextBold.color = subAccent
+            val stTextW = sbTextBold.measureText(statusText)
+
+            val stPillW = stTextW + 28f * dp
+            val stPillH = 26f * dp
+            val stPillL = centerX - stPillW / 2f
+            val stPillT = radarY + 20f * dp
+            sbRectF.set(stPillL, stPillT, stPillL + stPillW, stPillT + stPillH)
+
+            sbBadgeBgPaint.color = if (isError) Color.argb(120, 69, 10, 10) else Color.argb(120, 6, 78, 59)
+            canvas.drawRoundRect(sbRectF, stPillH / 2f, stPillH / 2f, sbBadgeBgPaint)
+
+            sbBadgeBorderPaint.color = mainAccent
+            sbBadgeBorderPaint.strokeWidth = 1.2f * dp
+            canvas.drawRoundRect(sbRectF, stPillH / 2f, stPillH / 2f, sbBadgeBorderPaint)
+
+            sbTextBold.textAlign = Paint.Align.CENTER
+            canvas.drawText(statusText, centerX, stPillT + 17f * dp, sbTextBold)
+
+            // Büyük Başlık ("Bilgisayarınız Bekleniyor" - Ekrana Tam Ortalı)
+            val mainTitle = if (isError) (errorMsg ?: "Soket Hatası") else "Bilgisayarınız Bekleniyor"
+            sbTextBold.textSize = 21f * sp
+            sbTextBold.color = Color.rgb(248, 250, 252)
+            sbTextBold.textAlign = Paint.Align.CENTER
+            val mainTitleY = stPillT + stPillH + 20f * sp
+            canvas.drawText(mainTitle, centerX, mainTitleY, sbTextBold)
+
+            // Alt Açıklama
+            val subTitle = if (isError) "Lütfen başka bir uygulamanın port 55555'i kullanmadığından emin olun"
+                           else "PC'de MobiDesk uygulamasını açtığınızda ekranınız otomatik olarak açılacaktır"
+            sbTextRegular.textSize = 11f * sp
+            sbTextRegular.color = Color.rgb(148, 163, 184)
+            sbTextRegular.textAlign = Paint.Align.CENTER
+            val subTitleY = mainTitleY + 15f * sp
+            canvas.drawText(subTitle, centerX, subTitleY, sbTextRegular)
+
+            // 6. Altta Konumlandırılmış Container Çizimi
+            sbRectF.set(cardLeft, cardTop, cardLeft + cardW, cardBottom)
+            sbCardBgPaint.color = Color.rgb(15, 23, 42)
+            canvas.drawRoundRect(sbRectF, cardRadius, cardRadius, sbCardBgPaint)
+
+            sbCardBorderPaint.color = Color.rgb(30, 41, 59)
+            sbCardBorderPaint.strokeWidth = 1.2f * dp
+            canvas.drawRoundRect(sbRectF, cardRadius, cardRadius, sbCardBorderPaint)
+
+            // --- SOL KOLON: KABLOLU BAĞLANTI (USB) ---
+            sbTextBold.textAlign = Paint.Align.LEFT
+            sbTextRegular.textAlign = Paint.Align.LEFT
+
+            val tag1 = "⚡ AKTİF MOD (0 MS GECİKME)"
+            sbTextBold.textSize = 9.8f * sp
+            sbTextBold.color = Color.rgb(56, 189, 248)
+            val tag1W = sbTextBold.measureText(tag1)
+            val tag1H = 22f * dp
+            val tag1L = col1L
+            val tag1T = cardTop + 12f * dp
+            sbRectF2.set(tag1L, tag1T, tag1L + tag1W + 16f * dp, tag1T + tag1H)
+            sbBadgeBgPaint.color = Color.rgb(12, 74, 110)
+            canvas.drawRoundRect(sbRectF2, tag1H / 2f, tag1H / 2f, sbBadgeBgPaint)
+            canvas.drawText(tag1, tag1L + 8f * dp, tag1T + 14.5f * dp, sbTextBold)
+
+            // Sol Başlık
+            sbTextBold.textSize = 15f * sp
+            sbTextBold.color = Color.WHITE
+            val solTitleY = tag1T + tag1H + 18f * sp
+            canvas.drawText("Kablolu Bağlantı (USB)", col1L, solTitleY, sbTextBold)
+
+            // Sol Maddeler
+            val stepY = solTitleY + 20f * sp
+            val lineSpace = 18f * sp
+
+            sbTextRegular.textSize = 11.2f * sp
+            sbTextRegular.color = Color.rgb(241, 245, 249)
+            canvas.drawText("• Cihazı USB kablosu ile bilgisayara bağlayın", col1L, stepY, sbTextRegular)
+
+            sbTextRegular.color = Color.rgb(148, 163, 184)
+            canvas.drawText("• MobiDesk PC uygulaması ADB tünelini otomatik kurar", col1L, stepY + lineSpace, sbTextRegular)
+
+            sbTextRegular.color = Color.rgb(100, 116, 139)
+            canvas.drawText("• 60 FPS donanım hızlandırmalı sıfır gecikme ve şarj desteği", col1L, stepY + lineSpace * 2f, sbTextRegular)
+
+            // --- SAĞ KOLON: ÖNEMLİ GEREKSİNİM (USB HATA AYIKLAMA KUTUSU) ---
+            val boxT = cardTop + 8f * dp
+            val boxB = cardBottom - 8f * dp
+            sbRectF2.set(col2L, boxT, col2L + colW, boxB)
+
+            // Kutu Dolgusu (Derin lacivert) & Amber Çerçeve
+            sbBadgeBgPaint.color = Color.argb(160, 19, 30, 53)
+            canvas.drawRoundRect(sbRectF2, 10f * dp, 10f * dp, sbBadgeBgPaint)
+
+            sbBadgeBorderPaint.color = Color.rgb(245, 158, 11) // Amber dikkat çizgisi
+            sbBadgeBorderPaint.strokeWidth = 1.3f * dp
+            canvas.drawRoundRect(sbRectF2, 10f * dp, 10f * dp, sbBadgeBorderPaint)
+
+            val boxPadL = col2L + 14f * dp
+
+            // Uyarı Rozeti
+            val warnBadge = "⚠️ ÖNEMLİ GEREKSİNİM"
+            sbTextBold.textSize = 9.2f * sp
+            sbTextBold.color = Color.rgb(253, 230, 138)
+            val wbW = sbTextBold.measureText(warnBadge)
+            val wbH = 20f * dp
+            val wbT = boxT + 9f * dp
+            val sbRectF3 = RectF(boxPadL, wbT, boxPadL + wbW + 14f * dp, wbT + wbH)
+            sbCardBgPaint.color = Color.rgb(120, 53, 15)
+            canvas.drawRoundRect(sbRectF3, wbH / 2f, wbH / 2f, sbCardBgPaint)
+            canvas.drawText(warnBadge, boxPadL + 7f * dp, wbT + 13.5f * dp, sbTextBold)
+
+            // Kutu Başlığı
+            sbTextBold.textSize = 13.5f * sp
+            sbTextBold.color = Color.rgb(251, 191, 36)
+            val boxTitleY = wbT + wbH + 16f * sp
+            canvas.drawText("USB Hata Ayıklama Açık Olmalıdır", boxPadL, boxTitleY, sbTextBold)
+
+            // Kutu Adımları
+            val boxStepY = boxTitleY + 18f * sp
+            val boxLineSpace = 17f * sp
+
+            sbTextRegular.textSize = 11.2f * sp
+            sbTextRegular.color = Color.rgb(241, 245, 249)
+            canvas.drawText("1. Cihaz Ayarları > Geliştirici Seçenekleri menüsüne gidin", boxPadL, boxStepY, sbTextRegular)
+
+            sbTextBold.textSize = 11.2f * sp
+            sbTextBold.color = Color.rgb(110, 231, 183)
+            canvas.drawText("2. \"USB Hata Ayıklama\" (USB Debugging) seçeneğini AÇIN", boxPadL, boxStepY + boxLineSpace, sbTextBold)
+
+            sbTextRegular.textSize = 9.8f * sp
+            sbTextRegular.color = Color.rgb(148, 163, 184)
+            canvas.drawText("(Menü yoksa: Ayarlar > Cihaz Hakkında > 'Yapım Numarası'na 7 kez dokunun)", boxPadL, boxStepY + boxLineSpace * 2f, sbTextRegular)
+
+            // 7. En Alt Bilgi Çubuğu (Footer Bar)
+            val footY = h - 10f * dp
+            sbTextRegular.textSize = 10f * sp
+            sbTextRegular.color = Color.rgb(100, 116, 139)
+            sbTextRegular.textAlign = Paint.Align.LEFT
+            canvas.drawText("✦ Dokunmatik ekran devrede  •  Sol üste çift dokunma: FPS sayacını açar/kapatır", padX, footY, sbTextRegular)
+
+            val rightFoot = "● TCP Dinleniyor (Port 55555)  •  MobiDesk Studio (Beta)"
+            sbTextBold.textSize = 10.5f * sp
+            sbTextBold.color = Color.rgb(16, 185, 129)
+            sbTextBold.textAlign = Paint.Align.RIGHT
+            canvas.drawText(rightFoot, w - padX, footY, sbTextBold)
         }
     }
 }
