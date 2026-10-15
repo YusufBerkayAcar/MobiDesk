@@ -8,10 +8,20 @@ using System.Drawing.Text;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
+
+[assembly: AssemblyTitle("MobiDesk")]
+[assembly: AssemblyDescription("MobiDesk - High-Performance Display & Mobile Continuity Ecosystem")]
+[assembly: AssemblyProduct("MobiDesk")]
+[assembly: AssemblyCompany("MobiDesk")]
+[assembly: AssemblyCopyright("Copyright © 2026")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
 
 namespace ScreenMonitoringApp
 {
@@ -124,6 +134,7 @@ namespace ScreenMonitoringApp
                 Application.SetCompatibleTextRenderingDefault(false);
 
                 bool autoStart = false;
+                bool startMinimized = false;
                 string snapshotPath = null;
                 bool closeAfterSnapshot = false;
                 int initialTab = 0;
@@ -132,6 +143,9 @@ namespace ScreenMonitoringApp
                     for (int i = 0; i < args.Length; i++)
                     {
                         if (string.Equals(args[i], "--autostart", StringComparison.OrdinalIgnoreCase)) autoStart = true;
+                        if (string.Equals(args[i], "--minimized", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(args[i], "--tray", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(args[i], "--startup", StringComparison.OrdinalIgnoreCase)) startMinimized = true;
                         if (string.Equals(args[i], "--snapshot", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) snapshotPath = args[i + 1];
                         if (string.Equals(args[i], "--closeAfterSnapshot", StringComparison.OrdinalIgnoreCase)) closeAfterSnapshot = true;
                         if (string.Equals(args[i], "--tab", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out initialTab);
@@ -250,8 +264,8 @@ namespace ScreenMonitoringApp
 
                 try
                 {
-                    Log("Starting MainForm autoStart=" + autoStart + ", snapshot=" + (snapshotPath ?? "none") + ", tab=" + initialTab);
-                    Application.Run(new MainForm(autoStart, snapshotPath, closeAfterSnapshot, initialTab));
+                    Log("Starting MainForm autoStart=" + autoStart + ", snapshot=" + (snapshotPath ?? "none") + ", tab=" + initialTab + ", minimized=" + startMinimized);
+                    Application.Run(new MainForm(autoStart, snapshotPath, closeAfterSnapshot, initialTab, startMinimized));
                     Log("Application.Run exited normally");
                 }
                 finally
@@ -661,7 +675,10 @@ namespace ScreenMonitoringApp
         private ModernSwitch swAdaptiveFps;
         private ModernSwitch swShowFps;
         private ModernSwitch swBatterySaver;
+        private ModernSwitch swStartup;
         private volatile bool enableAdaptiveFps = true;
+        private bool startMinimized = false;
+        private bool hasShownInitial = false;
         private ModernButton btnStartStop;
 
         // Dinamik USB Cihaz İzleme
@@ -753,8 +770,9 @@ namespace ScreenMonitoringApp
             return null;
         }
 
-        public MainForm(bool autoStart = false, string snapshotPath = null, bool closeAfterSnapshot = false, int initialTab = 0)
+        public MainForm(bool autoStart = false, string snapshotPath = null, bool closeAfterSnapshot = false, int initialTab = 0, bool startMinimized = false)
         {
+            this.startMinimized = startMinimized;
             try { timeBeginPeriod(1); } catch { }
 
             try
@@ -855,13 +873,35 @@ namespace ScreenMonitoringApp
             this.Shown += delegate(object s, EventArgs e)
             {
                 Program.Log("MainForm.Shown fired");
-                try
+                if (startMinimized)
                 {
-                    this.BringToFront();
-                    this.Activate();
-                    ForceForegroundWindow(this.Handle);
+                    this.WindowState = FormWindowState.Minimized;
+                    this.Hide();
+                    this.ShowInTaskbar = false;
+                    if (trayIcon != null)
+                    {
+                        trayIcon.Visible = true;
+                        trayIcon.ShowBalloonTip(
+                            2500,
+                            "MobiDesk",
+                            L10n.T(
+                                "MobiDesk arka planda çalışıyor. USB ile bağlı telefonunuzun bildirimleri aktarılmaya hazır.",
+                                "MobiDesk is running in background. Plugged-in phone notifications ready to sync."
+                            ),
+                            ToolTipIcon.Info
+                        );
+                    }
                 }
-                catch { }
+                else
+                {
+                    try
+                    {
+                        this.BringToFront();
+                        this.Activate();
+                        ForceForegroundWindow(this.Handle);
+                    }
+                    catch { }
+                }
 
                 if (flowManager != null)
                 {
@@ -911,6 +951,16 @@ namespace ScreenMonitoringApp
             {
                 this.Load += delegate(object s, EventArgs e) { StartStreaming(); };
             }
+        }
+
+        protected override void SetVisibleCore(bool value)
+        {
+            if (startMinimized && !hasShownInitial)
+            {
+                value = false;
+                if (!this.IsHandleCreated) CreateHandle();
+            }
+            base.SetVisibleCore(value);
         }
 
         private void ApplyModernWindowStyle()
@@ -1206,13 +1256,13 @@ namespace ScreenMonitoringApp
 
             pnlRightCol.Controls.Add(cardPerf);
 
-            // Sağ Kart 2: Sistem ve Motor Seçenekleri (H=198, Y=206)
-            cardOpts = new ModernCard("SİSTEM VE OPTİMİZASYONLAR", 0, 206, colW, 198);
+            // Sağ Kart 2: Sistem ve Motor Seçenekleri (H=206, Y=202)
+            cardOpts = new ModernCard("SİSTEM VE OPTİMİZASYONLAR", 0, 202, colW, 206);
 
             swAdaptiveFps = new ModernSwitch(
-                "⚡ Akıllı 60 FPS Performans Modu",
-                "Yüksek pikselli cihazları 60 FPS'e dengeler (Kapalıyken 1:1)",
-                12, 28, colW - 24, 48
+                "⚡ " + L10n.T("Akıllı 60 FPS Performans Modu", "Smart 60 FPS Performance Mode"),
+                L10n.T("Yüksek pikselli cihazları 60 FPS'e dengeler (Kapalıyken 1:1)", "Balances high-res devices for 60 FPS (1:1 when off)"),
+                12, 26, colW - 24, 42
             );
             swAdaptiveFps.Checked = AppConfig.AdaptiveFps;
             swAdaptiveFps.CheckedChanged += delegate(object s, EventArgs e)
@@ -1225,9 +1275,9 @@ namespace ScreenMonitoringApp
             cardOpts.Controls.Add(swAdaptiveFps);
 
             swShowFps = new ModernSwitch(
-                "Cihazda Canlı FPS Sayacı Göster",
-                "Sol üst köşede yeşil donanım OSD sayacı gösterir",
-                12, 82, colW - 24, 48
+                L10n.T("Cihazda Canlı FPS Sayacı Göster", "Show Live FPS Counter on Device"),
+                L10n.T("Sol üst köşede yeşil donanım OSD sayacı gösterir", "Displays green on-screen OSD telemetry counter"),
+                12, 70, colW - 24, 42
             );
             swShowFps.Checked = AppConfig.ShowFps;
             swShowFps.CheckedChanged += delegate(object s, EventArgs e)
@@ -1240,9 +1290,9 @@ namespace ScreenMonitoringApp
             cardOpts.Controls.Add(swShowFps);
 
             swBatterySaver = new ModernSwitch(
-                "Akıllı Güç ve Veri Tasarrufu",
-                "Statik ekranda gereksiz veri aktarımını durdurur",
-                12, 136, colW - 24, 48
+                L10n.T("Akıllı Güç ve Veri Tasarrufu", "Smart Power & Data Saver"),
+                L10n.T("Statik ekranda gereksiz veri aktarımını durdurur", "Pauses transmission when screen is static"),
+                12, 114, colW - 24, 42
             );
             swBatterySaver.Checked = AppConfig.BatterySaver;
             swBatterySaver.CheckedChanged += delegate(object s, EventArgs e)
@@ -1252,6 +1302,19 @@ namespace ScreenMonitoringApp
                 AppConfig.Save();
             };
             cardOpts.Controls.Add(swBatterySaver);
+
+            swStartup = new ModernSwitch(
+                "🪟 " + L10n.T("Windows ile Birlikte Başlat", "Start with Windows"),
+                L10n.T("PC açılışında arka planda sessizce başlar, bildirimleri yakalar", "Starts silently in tray on boot to capture notifications"),
+                12, 158, colW - 24, 42
+            );
+            swStartup.Checked = WindowsStartupManager.IsStartupEnabled();
+            swStartup.CheckedChanged += delegate(object s, EventArgs e)
+            {
+                WindowsStartupManager.SetStartup(swStartup.Checked);
+                if (pnlNotifications != null) pnlNotifications.UpdateStartupState();
+            };
+            cardOpts.Controls.Add(swStartup);
 
             pnlRightCol.Controls.Add(cardOpts);
 
@@ -1488,24 +1551,29 @@ namespace ScreenMonitoringApp
             if (cardOpts != null)
             {
                 int optsY = 202;
-                int optsH = Math.Max(198, colH - optsY);
+                int optsH = Math.Max(206, colH - optsY);
                 cardOpts.Location = new Point(0, optsY);
                 cardOpts.Size = new Size(colW, optsH);
 
                 if (swAdaptiveFps != null)
                 {
-                    swAdaptiveFps.Location = new Point(12, 28);
-                    swAdaptiveFps.Size = new Size(colW - 24, 48);
+                    swAdaptiveFps.Location = new Point(12, 26);
+                    swAdaptiveFps.Size = new Size(colW - 24, 42);
                 }
                 if (swShowFps != null)
                 {
-                    swShowFps.Location = new Point(12, 82);
-                    swShowFps.Size = new Size(colW - 24, 48);
+                    swShowFps.Location = new Point(12, 70);
+                    swShowFps.Size = new Size(colW - 24, 42);
                 }
                 if (swBatterySaver != null)
                 {
-                    swBatterySaver.Location = new Point(12, 136);
-                    swBatterySaver.Size = new Size(colW - 24, 48);
+                    swBatterySaver.Location = new Point(12, 114);
+                    swBatterySaver.Size = new Size(colW - 24, 42);
+                }
+                if (swStartup != null)
+                {
+                    swStartup.Location = new Point(12, 158);
+                    swStartup.Size = new Size(colW - 24, 42);
                 }
             }
 
@@ -1707,6 +1775,13 @@ namespace ScreenMonitoringApp
                 swBatterySaver.UpdateText(
                     L10n.T("Akıllı Güç ve Veri Tasarrufu", "Smart Power & Data Saver"),
                     L10n.T("Statik ekranda gereksiz veri aktarımını durdurur", "Pauses transmission when screen is static")
+                );
+            }
+            if (swStartup != null)
+            {
+                swStartup.UpdateText(
+                    "🪟 " + L10n.T("Windows ile Birlikte Başlat", "Start with Windows"),
+                    L10n.T("PC açılışında arka planda sessizce başlar, bildirimleri yakalar", "Starts silently in tray on boot to capture notifications")
                 );
             }
 
@@ -3225,6 +3300,7 @@ namespace ScreenMonitoringApp
                 trayIcon.BalloonTipClicked += delegate(object s, EventArgs e)
                 {
                     RestoreFromTray();
+                    SwitchStudioTab(2);
                 };
 
                 UpdateTrayMenuStrings();
@@ -3242,6 +3318,9 @@ namespace ScreenMonitoringApp
                 try { this.BeginInvoke(new Action(RestoreFromTray)); } catch { }
                 return;
             }
+            hasShownInitial = true;
+            startMinimized = false;
+            this.ShowInTaskbar = true;
             if (!this.Visible)
             {
                 this.Visible = true;
@@ -3334,8 +3413,8 @@ namespace ScreenMonitoringApp
             }
             catch { }
 
-            // Yalnızca aktif yayın yapılıyorsa arka planda (tepside) çalışmaya devam et
-            if (!reallyExit && e.CloseReason == CloseReason.UserClosing && isStreaming)
+            // Yalnızca aktif yayın yapılıyorsa VEYA Windows başlangıç modu açıksa arka planda (tepside) çalışmaya devam et
+            if (!reallyExit && e.CloseReason == CloseReason.UserClosing && (isStreaming || WindowsStartupManager.IsStartupEnabled()))
             {
                 e.Cancel = true;
                 this.Hide();
@@ -3438,6 +3517,21 @@ namespace ScreenMonitoringApp
             {
                 if (pnlNotifications != null) pnlNotifications.AddNotification(item);
                 if (currentTabIndex != 2 && tabSelector != null) tabSelector.NotificationBadge++;
+
+                // Masaüstü bildirim balonu (Pencere odakta değilse veya tepsideyse göster)
+                bool isForeground = (this.Visible && this.WindowState != FormWindowState.Minimized && Form.ActiveForm == this);
+                if (!isForeground && trayIcon != null && item != null)
+                {
+                    try
+                    {
+                        string notifTitle = string.IsNullOrEmpty(item.AppName) ? item.Title : (item.AppName + " • " + item.Title);
+                        if (string.IsNullOrEmpty(notifTitle)) notifTitle = "MobiDesk Bildirim";
+                        string notifBody = string.IsNullOrEmpty(item.Text) ? "Yeni bildirim alındı" : item.Text;
+                        if (notifBody.Length > 200) notifBody = notifBody.Substring(0, 197) + "...";
+                        trayIcon.ShowBalloonTip(4000, notifTitle, notifBody, ToolTipIcon.Info);
+                    }
+                    catch { }
+                }
             });
         }
 
@@ -6174,6 +6268,63 @@ namespace ScreenMonitoringApp
         }
     }
 
+    public static class WindowsStartupManager
+    {
+        private const string RUN_KEY = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string APP_NAME = "MobiDesk";
+
+        public static bool IsStartupEnabled()
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RUN_KEY, false))
+                {
+                    if (key != null)
+                    {
+                        object val = key.GetValue(APP_NAME);
+                        return val != null;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.Log("IsStartupEnabled error: " + ex.Message);
+            }
+            return false;
+        }
+
+        public static bool SetStartup(bool enable)
+        {
+            try
+            {
+                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RUN_KEY, true))
+                {
+                    if (key != null)
+                    {
+                        if (enable)
+                        {
+                            string exePath = Application.ExecutablePath;
+                            string cmd = "\"" + exePath + "\" --minimized";
+                            key.SetValue(APP_NAME, cmd);
+                            Program.Log("Startup enabled in registry: " + cmd);
+                        }
+                        else
+                        {
+                            key.DeleteValue(APP_NAME, false);
+                            Program.Log("Startup disabled in registry");
+                        }
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Program.Log("SetStartup error: " + ex.Message);
+            }
+            return false;
+        }
+    }
+
     // ═══════════════════════════════════════════════
     // MOBIDESK FLOW & BİLDİRİM SENKRONİZASYON PROTOKOLÜ (C# 5 UYUMLU)
     // ═══════════════════════════════════════════════
@@ -7629,6 +7780,7 @@ namespace ScreenMonitoringApp
         private MobiFlowManager flowManager;
         private Panel pnlHeader;
         private ModernButton btnClearAll;
+        private ModernButton btnStartupToggle;
         private Panel pnlNotifsList;
         private Label lblTitle;
         private Label lblCount;
@@ -7741,6 +7893,17 @@ namespace ScreenMonitoringApp
             };
             pnlHeader.Controls.Add(cbDeviceFilter);
 
+            btnStartupToggle = new ModernButton("", w - 340, 7, 184, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
+            btnStartupToggle.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
+            UpdateStartupButtonText();
+            btnStartupToggle.Click += delegate
+            {
+                bool newState = !WindowsStartupManager.IsStartupEnabled();
+                WindowsStartupManager.SetStartup(newState);
+                UpdateStartupButtonText();
+            };
+            pnlHeader.Controls.Add(btnStartupToggle);
+
             btnClearAll = new ModernButton(L10n.T("🗑️ Tümünü Temizle", "🗑️ Clear All"), w - 150, 7, 138, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
             btnClearAll.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
             btnClearAll.Click += delegate
@@ -7767,8 +7930,8 @@ namespace ScreenMonitoringApp
             lblEmptyHint = new Label
             {
                 Text = L10n.T(
-                    "🔔 Henüz yeni bir bildirim yok\n\nTablet veya telefonunuza gelen bildirimler burada anlık olarak görünecektir.\n(Cihazınızda MobiDesk Bildirim İzninin açık olduğundan emin olun.)",
-                    "🔔 No new notifications yet\n\nNotifications from your tablet or phone will appear here in real time.\n(Make sure MobiDesk Notification Access is enabled on your device.)"
+                    "🔔 Henüz yeni bir bildirim yok\n\nTelefonunuz USB ile şarj olurken MobiDesk kapalı olsa bile gelen bildirimler buraya aktarılır.\n(Cihazınızda MobiDesk Bildirim İzninin açık olduğundan emin olun.)",
+                    "🔔 No new notifications yet\n\nIncoming notifications mirror here even if MobiDesk is closed while charging over USB.\n(Make sure MobiDesk Notification Access is enabled on your device.)"
                 ),
                 Font = new Font("Segoe UI", 9.5f, FontStyle.Regular),
                 ForeColor = MainForm.ColorTextMuted,
@@ -7788,11 +7951,12 @@ namespace ScreenMonitoringApp
             if (lblTitle != null) lblTitle.Text = L10n.T("🔔 Mobil Bildirim Aynalama", "🔔 Mobile Notification Mirroring");
             if (lblFilterLabel != null) lblFilterLabel.Text = L10n.T("Filtrele:", "Filter:");
             if (btnClearAll != null) btnClearAll.Text = L10n.T("🗑️ Tümünü Temizle", "🗑️ Clear All");
+            UpdateStartupButtonText();
             if (lblEmptyHint != null)
             {
                 lblEmptyHint.Text = L10n.T(
-                    "🔔 Henüz yeni bir bildirim yok\n\nTablet veya telefonunuza gelen bildirimler burada anlık olarak görünecektir.\n(Cihazınızda MobiDesk Bildirim İzninin açık olduğundan emin olun.)",
-                    "🔔 No new notifications yet\n\nNotifications from your tablet or phone will appear here in real time.\n(Make sure MobiDesk Notification Access is enabled on your device.)"
+                    "🔔 Henüz yeni bir bildirim yok\n\nTelefonunuz USB ile şarj olurken MobiDesk kapalı olsa bile gelen bildirimler buraya aktarılır.\n(Cihazınızda MobiDesk Bildirim İzninin açık olduğundan emin olun.)",
+                    "🔔 No new notifications yet\n\nIncoming notifications mirror here even if MobiDesk is closed while charging over USB.\n(Make sure MobiDesk Notification Access is enabled on your device.)"
                 );
             }
             if (cbDeviceFilter != null && cbDeviceFilter.Items.Count > 0)
@@ -7904,6 +8068,10 @@ namespace ScreenMonitoringApp
                 {
                     btnClearAll.Location = new Point(curW - 148, 7);
                 }
+                if (btnStartupToggle != null)
+                {
+                    btnStartupToggle.Location = new Point(curW - 340, 7);
+                }
             }
 
             if (pnlNotifsList != null)
@@ -7915,6 +8083,23 @@ namespace ScreenMonitoringApp
                     lblEmptyHint.Size = new Size(Math.Max(200, curW - 40), 120);
                 }
             }
+        }
+
+        public void UpdateStartupState()
+        {
+            UpdateStartupButtonText();
+        }
+
+        private void UpdateStartupButtonText()
+        {
+            if (btnStartupToggle == null) return;
+            bool enabled = WindowsStartupManager.IsStartupEnabled();
+            btnStartupToggle.Text = enabled
+                ? L10n.T("🪟 Windows Başlangıcı: Açık", "🪟 Windows Startup: On")
+                : L10n.T("🪟 Windows Başlangıcı: Kapalı", "🪟 Windows Startup: Off");
+            btnStartupToggle.ForeColor = enabled
+                ? MainForm.ColorSuccess
+                : MainForm.ColorTextMuted;
         }
 
         public void SetConnected(bool connected)

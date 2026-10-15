@@ -83,14 +83,51 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
+    private var hasPromptedNotif = false
+
     override fun onDestroy() {
         super.onDestroy()
-        MobiFlowServer.instance.stop()
+        // If notification listener is NOT enabled, we can stop the server.
+        // If notification listener IS enabled, KEEP MobiFlowServer running so notifications & flow
+        // continue mirroring over USB even when MainActivity is closed!
+        if (!MobiNotificationService.isNotificationListenerEnabled(this)) {
+            MobiFlowServer.instance.stop()
+        }
     }
 
     override fun onResume() {
         super.onResume()
         setFullscreen()
+        checkNotificationPermissionPrompt()
+    }
+
+    private fun checkNotificationPermissionPrompt() {
+        if (!MobiNotificationService.isNotificationListenerEnabled(this)) {
+            if (hasPromptedNotif) return
+            hasPromptedNotif = true
+
+            val isEn = java.util.Locale.getDefault().language.startsWith("en", ignoreCase = true)
+            val title = if (isEn) "🔔 Background Notification Access" else "🔔 Arka Planda Bildirim İzni"
+            val message = if (isEn) {
+                "To mirror notifications to your PC even when your phone is locked, charging, or the app is closed, MobiDesk needs Notification Access.\n\nOnce granted, you do not need to keep MobiDesk open on your phone."
+            } else {
+                "Telefonunuz USB ile bilgisayara bağlıyken (şarj olurken veya ekran kapalıyken bile) gelen tüm bildirimleri bilgisayarınızda anında görebilmek için MobiDesk'e bildirim okuma izni vermelisiniz.\n\nİzin verdikten sonra telefonunuzda uygulamayı açık tutmanıza gerek kalmaz."
+            }
+            val posBtn = if (isEn) "Grant Access / Open Settings" else "İzin Ver / Ayarları Aç"
+            val negBtn = if (isEn) "Later" else "Daha Sonra"
+
+            try {
+                android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle(title)
+                    .setMessage(message)
+                    .setPositiveButton(posBtn) { _, _ ->
+                        MobiNotificationService.openNotificationSettings(this)
+                    }
+                    .setNegativeButton(negBtn, null)
+                    .setCancelable(true)
+                    .show()
+            } catch (_: Exception) {}
+        }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

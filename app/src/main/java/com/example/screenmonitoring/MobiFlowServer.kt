@@ -31,6 +31,8 @@ class MobiFlowServer private constructor() {
     }
 
     private val isRunning = AtomicBoolean(false)
+    val isRunningNow: Boolean
+        get() = isRunning.get()
     private var serverSocket: ServerSocket? = null
     private var activeSocket: Socket? = null
     private var outputStream: OutputStream? = null

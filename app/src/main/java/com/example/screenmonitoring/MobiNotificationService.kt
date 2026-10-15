@@ -53,8 +53,14 @@ class MobiNotificationService : NotificationListenerService(), MobiFlowServer.Fl
 
     override fun onCreate() {
         super.onCreate()
-        MobiFlowServer.instance.addListener(this)
-        Log.i(TAG, "MobiNotificationService created")
+        try {
+            MobiFlowServer.instance.init(applicationContext)
+            MobiFlowServer.instance.start()
+            MobiFlowServer.instance.addListener(this)
+            Log.i(TAG, "MobiNotificationService created & MobiFlowServer started")
+        } catch (e: Exception) {
+            Log.w(TAG, "MobiNotificationService onCreate error: ${e.message}")
+        }
     }
 
     override fun onDestroy() {
@@ -68,6 +74,8 @@ class MobiNotificationService : NotificationListenerService(), MobiFlowServer.Fl
         isServiceConnected = true
         Log.i(TAG, "Notification listener connected!")
         try {
+            MobiFlowServer.instance.init(applicationContext)
+            MobiFlowServer.instance.start()
             val active = activeNotifications
             if (active != null) {
                 for (sbn in active) {
@@ -85,6 +93,12 @@ class MobiNotificationService : NotificationListenerService(), MobiFlowServer.Fl
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        try {
+            if (!MobiFlowServer.instance.isRunningNow) {
+                MobiFlowServer.instance.init(applicationContext)
+                MobiFlowServer.instance.start()
+            }
+        } catch (_: Exception) {}
         processNotification(sbn)
     }
 
