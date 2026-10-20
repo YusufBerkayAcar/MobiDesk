@@ -42,11 +42,31 @@ namespace ScreenMonitoringApp
         [DllImport("user32.dll")]
         private static extern bool AllowSetForegroundWindow(int dwProcessId);
 
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
         private const int ASFW_ANY = -1;
 
         private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xffff);
 
         private static readonly IntPtr DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
+
+        private static Mutex appMutex = null;
+        private static EventWaitHandle wakeupEvent = null;
 
         public static void Log(string msg)
         {
@@ -91,6 +111,8 @@ namespace ScreenMonitoringApp
             }
             catch { }
         }
+
+        public static bool MockTestNotifications = false;
 
         [STAThread]
         static void Main(string[] args)
@@ -138,10 +160,14 @@ namespace ScreenMonitoringApp
                 string snapshotPath = null;
                 bool closeAfterSnapshot = false;
                 int initialTab = 0;
+                bool runTests = false;
                 if (args != null)
                 {
                     for (int i = 0; i < args.Length; i++)
                     {
+                        if (string.Equals(args[i], "--test", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(args[i], "--tests", StringComparison.OrdinalIgnoreCase) ||
+                            string.Equals(args[i], "--run-tests", StringComparison.OrdinalIgnoreCase)) runTests = true;
                         if (string.Equals(args[i], "--autostart", StringComparison.OrdinalIgnoreCase)) autoStart = true;
                         if (string.Equals(args[i], "--minimized", StringComparison.OrdinalIgnoreCase) ||
                             string.Equals(args[i], "--tray", StringComparison.OrdinalIgnoreCase) ||
@@ -150,7 +176,15 @@ namespace ScreenMonitoringApp
                         if (string.Equals(args[i], "--closeAfterSnapshot", StringComparison.OrdinalIgnoreCase)) closeAfterSnapshot = true;
                         if (string.Equals(args[i], "--tab", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) int.TryParse(args[i + 1], out initialTab);
                         if (string.Equals(args[i], "--device", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length) MainForm.activeTargetSerial = args[i + 1];
+                        if (string.Equals(args[i], "--mock", StringComparison.OrdinalIgnoreCase)) MockTestNotifications = true;
                     }
+                }
+
+                if (runTests)
+                {
+                    int testCode = MobiTestSuite.RunAll();
+                    Environment.Exit(testCode);
+                    return;
                 }
 
                 bool isSnapshot = !string.IsNullOrEmpty(snapshotPath);
@@ -158,10 +192,37 @@ namespace ScreenMonitoringApp
                 const string EVENT_NAME = @"Local\MobiDesk_Wakeup_Event_v1";
                 const string MSG_NAME = "MOBIDESK_SHOW_INSTANCE_MESSAGE";
 
-                bool createdNewMutex = false;
-                Mutex appMutex = null;
-                EventWaitHandle wakeupEvent = null;
+                Process cur = Process.GetCurrentProcess();
+                List<Process> othersList = new List<Process>();
+                try
+                {
+                    foreach (Process p in Process.GetProcessesByName("MobiDesk"))
+                    {
+                        if (p.Id != cur.Id) othersList.Add(p);
+                    }
+                }
+                catch { }
+                try
+                {
+                    if (!cur.ProcessName.Equals("MobiDesk", StringComparison.OrdinalIgnoreCase))
+                    {
+                        foreach (Process p in Process.GetProcessesByName(cur.ProcessName))
+                        {
+                            if (p.Id != cur.Id)
+                            {
+                                bool exists = false;
+                                for (int i = 0; i < othersList.Count; i++)
+                                {
+                                    if (othersList[i].Id == p.Id) { exists = true; break; }
+                                }
+                                if (!exists) othersList.Add(p);
+                            }
+                        }
+                    }
+                }
+                catch { }
 
+                bool createdNewMutex = false;
                 if (!isSnapshot)
                 {
                     try
@@ -185,18 +246,25 @@ namespace ScreenMonitoringApp
                     catch (Exception ex)
                     {
                         Log("Mutex check exception: " + ex.Message);
-                        createdNewMutex = true;
                     }
 
-                    if (!createdNewMutex)
+                    if (!createdNewMutex || othersList.Count > 0)
                     {
-                        Log("MobiDesk is already running. Signaling existing instance to restore window...");
+                        Log("MobiDesk is already running (Mutex=" + createdNewMutex + ", OtherProcs=" + othersList.Count + "). Signaling existing instance to restore window...");
                         try { AllowSetForegroundWindow(ASFW_ANY); } catch { }
+
+                        foreach (Process p in othersList)
+                        {
+                            try { AllowSetForegroundWindow(p.Id); } catch { }
+                        }
+
+                        // 1. İsimlendirilmiş uyanma sinyalini gönder (Wakeup Event)
                         try
                         {
                             using (EventWaitHandle existingEvent = EventWaitHandle.OpenExisting(EVENT_NAME))
                             {
                                 existingEvent.Set();
+                                Log("Wakeup event signaled.");
                             }
                         }
                         catch (Exception ex)
@@ -204,51 +272,86 @@ namespace ScreenMonitoringApp
                             Log("OpenExisting EventWaitHandle exception: " + ex.Message);
                         }
 
+                        // 2. Kayıtlı pencere mesajını yayınla (Broadcast Window Message)
                         try
                         {
                             int msgId = RegisterWindowMessage(MSG_NAME);
                             if (msgId != 0)
                             {
                                 PostMessage(HWND_BROADCAST, msgId, IntPtr.Zero, IntPtr.Zero);
+                                Log("Broadcast window message sent.");
                             }
                         }
                         catch { }
 
-                        // Mevcut MobiDesk işlemini denetle (Pencerenin açılması için 350ms bekle)
-                        Thread.Sleep(350);
-                        Process cur = Process.GetCurrentProcess();
-                        Process[] others = Process.GetProcessesByName("MobiDesk");
-                        bool activeFound = false;
-
-                        foreach (Process p in others)
+                        // 3. Win32 EnumWindows ile mevcut sürecin gizli/küçültülmüş pencerelerini bulup doğrudan geri yükle
+                        try
                         {
-                            if (p.Id != cur.Id)
+                            EnumWindows(delegate(IntPtr hWnd, IntPtr lParam)
                             {
-                                try
+                                uint procId;
+                                GetWindowThreadProcessId(hWnd, out procId);
+                                if (procId != (uint)cur.Id)
                                 {
-                                    p.Refresh();
-                                    if (p.Responding && p.MainWindowHandle != IntPtr.Zero)
+                                    foreach (Process p in othersList)
                                     {
-                                        activeFound = true;
-                                        Log("Active instance with window (PID " + p.Id + ") restored.");
-                                    }
-                                    else
-                                    {
-                                        Log("Existing MobiDesk process (PID " + p.Id + ") has no visible window or is unresponsive. Terminating zombie process.");
-                                        try { p.Kill(); p.WaitForExit(1000); } catch { }
+                                        if (p.Id == (int)procId)
+                                        {
+                                            StringBuilder sb = new StringBuilder(256);
+                                            GetWindowText(hWnd, sb, 256);
+                                            string wTitle = sb.ToString();
+                                            if (!string.IsNullOrEmpty(wTitle) && wTitle.Contains("MobiDesk"))
+                                            {
+                                                ShowWindow(hWnd, 9 /* SW_RESTORE */);
+                                                ShowWindow(hWnd, 5 /* SW_SHOW */);
+                                                SetForegroundWindow(hWnd);
+                                                Log("Restored window handle " + hWnd + " for PID " + p.Id);
+                                            }
+                                        }
                                     }
                                 }
-                                catch { }
-                            }
+                                return true;
+                            }, IntPtr.Zero);
+                        }
+                        catch (Exception ex)
+                        {
+                            Log("EnumWindows restore exception: " + ex.Message);
                         }
 
-                        if (activeFound)
+                        // 4. Mevcut sürecin yanıt verip vermediğini denetle
+                        bool anyAlive = false;
+                        foreach (Process p in othersList)
                         {
-                            Log("Active instance signaled. Exiting second instance.");
+                            try
+                            {
+                                if (p.Responding)
+                                {
+                                    anyAlive = true;
+                                    Log("Existing active MobiDesk instance (PID " + p.Id + ") is responsive.");
+                                }
+                                else
+                                {
+                                    Log("Existing MobiDesk process (PID " + p.Id + ") is NOT responding.");
+                                }
+                            }
+                            catch { }
+                        }
+
+                        if (anyAlive)
+                        {
+                            Log("Existing active MobiDesk instance signaled. Exiting launcher instance.");
                             return;
                         }
 
-                        Log("No active responsive instance with visible window found. Proceeding to launch new instance.");
+                        // Yalnızca süreçler gerçekten kilitlenmiş/yanıt vermiyorsa zombi temizliği yap
+                        if (othersList.Count > 0)
+                        {
+                            Log("Existing processes were unresponsive. Terminating zombie processes and launching fresh instance...");
+                            foreach (Process p in othersList)
+                            {
+                                try { p.Kill(); p.WaitForExit(1000); } catch { }
+                            }
+                        }
                     }
 
                     try
@@ -671,15 +774,15 @@ namespace ScreenMonitoringApp
         private Label lblQualityTitle;
         private ModernSlider tbQuality;
         private Label lblQualityVal;
-        private ModernCard cardOpts;
-        private ModernSwitch swAdaptiveFps;
-        private ModernSwitch swShowFps;
-        private ModernSwitch swBatterySaver;
-        private ModernSwitch swStartup;
+        internal ModernCard cardOpts;
+        internal ModernSwitch swAdaptiveFps;
+        internal ModernSwitch swShowFps;
+        internal ModernSwitch swBatterySaver;
+        internal ModernSwitch swStartup;
         private volatile bool enableAdaptiveFps = true;
         private bool startMinimized = false;
         private bool hasShownInitial = false;
-        private ModernButton btnStartStop;
+        internal ModernButton btnStartStop;
 
         // Dinamik USB Cihaz İzleme
         private System.Windows.Forms.Timer deviceMonitorTimer;
@@ -697,9 +800,9 @@ namespace ScreenMonitoringApp
         private TelemetryBadge badgeLatency;
 
         // Düzen Konteynerleri ve Çipler
-        private DoubleBufferedPanel pnlLeftCol;
-        private DoubleBufferedPanel pnlRightCol;
-        private RoundedPanel pnlBottomBar;
+        internal DoubleBufferedPanel pnlLeftCol;
+        internal DoubleBufferedPanel pnlRightCol;
+        internal RoundedPanel pnlBottomBar;
         private List<QuickChip> fpsChips = new List<QuickChip>();
         private List<QuickChip> qualityChips = new List<QuickChip>();
 
@@ -717,7 +820,7 @@ namespace ScreenMonitoringApp
         private ToolStripMenuItem trayItemToggleStream;
         private ToolStripSeparator traySeparator1;
         private ToolStripMenuItem trayItemExit;
-        private bool reallyExit = false;
+        internal bool reallyExit = false;
         private bool hasShownTrayBalloon = false;
 
         protected override CreateParams CreateParams
@@ -801,7 +904,7 @@ namespace ScreenMonitoringApp
             this.DoubleBuffered = true;
             this.SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
-            this.MinimumSize = new Size(780, 672);
+            this.MinimumSize = new Size(860, 680);
             try { ChangeWindowMessageFilter(WM_SHOW_MOBIDESK, MSGFLT_ADD); } catch { }
 
             if (AppWakeupEvent != null)
@@ -913,6 +1016,12 @@ namespace ScreenMonitoringApp
                     tabSelector.SelectedIndex = initialTab;
                 }
 
+                if ((Program.MockTestNotifications || AppConfig.MockNotifications) && pnlNotifications != null)
+                {
+                    pnlNotifications.LoadMockNotifications();
+                    if (tabSelector != null && initialTab != 2) tabSelector.NotificationBadge = 9;
+                }
+
                 if (!string.IsNullOrEmpty(snapshotPath))
                 {
                     ThreadPool.QueueUserWorkItem(delegate(object state)
@@ -997,9 +1106,9 @@ namespace ScreenMonitoringApp
             this.ForeColor = ColorText;
             this.Font = new Font("Segoe UI", 9.0f, FontStyle.Regular);
 
-            int windowW = Math.Max(780, AppConfig.WindowWidth);
-            int windowH = Math.Max(672, AppConfig.WindowHeight);
-            this.MinimumSize = new Size(780, 672);
+            int windowW = Math.Max(860, AppConfig.WindowWidth);
+            int windowH = Math.Max(680, AppConfig.WindowHeight);
+            this.MinimumSize = new Size(860, 680);
             this.ClientSize = new Size(windowW, windowH);
 
             // 1. MODERN ENTEGRE BAŞLIK ÇUBUĞU
@@ -1043,7 +1152,8 @@ namespace ScreenMonitoringApp
             this.Controls.Add(tabSelector);
 
             int colY = 158;
-            int colH = Math.Max(370, windowH - colY - 124);
+            int bottomSpace = 118;
+            int colH = Math.Max(396, windowH - colY - bottomSpace);
             int colW = Math.Max(350, (windowW - 36 - 16) / 2);
 
             // ═══════════════════════════════════════════════
@@ -1056,12 +1166,12 @@ namespace ScreenMonitoringApp
                 BackColor = ColorBg
             };
 
-            // Sol Kart 1: Çalışma Modu (H=86)
-            cardMode = new ModernCard("ÇALIŞMA MODU (TOPOLOJİ)", 0, 0, colW, 86);
+            // Sol Kart 1: Çalışma Modu (H=84)
+            cardMode = new ModernCard("ÇALIŞMA MODU (TOPOLOJİ)", 0, 0, colW, 84);
             modeControl = new ModernSegmentedMode(
                 "🖥️ Genişlet (2. Ekran)",
                 "🔄 Yinele (Ayna)",
-                12, 30, colW - 24, 42
+                12, 28, colW - 24, 44
             );
             modeControl.IsExtend = AppConfig.IsExtendMode;
             modeControl.ModeChanged += delegate(bool isExtend)
@@ -1073,32 +1183,9 @@ namespace ScreenMonitoringApp
             cardMode.Controls.Add(modeControl);
             pnlLeftCol.Controls.Add(cardMode);
 
-            // Sol Kart 2: Yansıtılacak Monitör Seçimi (H=186, Y=100)
-            cardScreens = new ModernCard("YANSITILACAK MONİTÖR", 0, 100, colW, 186);
-            
-            btnRefresh = new ModernButton("🔄 Yenile", colW - 86, 7, 74, 22, Color.FromArgb(28, 36, 54), ColorTextMuted, 5);
-            btnRefresh.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
-            btnRefresh.Click += delegate(object s, EventArgs e) { RefreshScreenList(); };
-            cardScreens.Controls.Add(btnRefresh);
-
-            screenSelector = new ModernMonitorSelector(12, 34, colW - 24, 140);
-            screenSelector.SelectionChanged += delegate(int index, Screen scr, bool isVirt)
-            {
-                selectedScreenIndex = index;
-                if (scr != null)
-                {
-                    selectedDeviceName = scr.DeviceName;
-                    AppConfig.LastMonitorDevice = selectedDeviceName;
-                    AppConfig.Save();
-                    Rectangle phys = GetPhysicalMonitorBounds(selectedDeviceName);
-                    currentScreenBounds = (phys.Width > 0 && phys.Height > 0) ? phys : scr.Bounds;
-                }
-            };
-            cardScreens.Controls.Add(screenSelector);
-            pnlLeftCol.Controls.Add(cardScreens);
-
-            // Sol Kart 3: Sanal Ekran Sürücüsü (VDD) (H=104, Y=300)
-            cardVirtual = new ModernCard("SANAL 3. EKRAN YÖNETİMİ (VDD)", 0, 300, colW, 104);
+            // Sol Kart 3: Sanal Ekran Sürücüsü (VDD) (H=104, alta kilitli)
+            int cardVirtH = 104;
+            cardVirtual = new ModernCard("SANAL 3. EKRAN YÖNETİMİ (VDD)", 0, colH - cardVirtH, colW, cardVirtH);
 
             btnVirtualInfo = new ModernButton(L10n.T("ℹ️ Bilgi", "ℹ️ Info"), colW - 74, 7, 62, 22, Color.FromArgb(28, 36, 54), ColorAccent, 5);
             btnVirtualInfo.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
@@ -1119,17 +1206,43 @@ namespace ScreenMonitoringApp
             cardVirtual.Controls.Add(lblVddHint);
 
             int btnHalfW = (colW - 24 - 8) / 2;
-            btnAddVirtual = new ModernButton("➕ Sanal Ekran Ayarla", 12, 50, btnHalfW, 40, ColorPrimary, Color.White, 8);
+            btnAddVirtual = new ModernButton("➕ Sanal Ekran Ayarla", 12, 48, btnHalfW, 42, ColorPrimary, Color.White, 8);
             btnAddVirtual.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
             btnAddVirtual.Click += BtnAddVirtual_Click;
 
-            btnRemoveVirtual = new ModernButton("🗑️ Sürücüyü Kaldır", 12 + btnHalfW + 8, 50, btnHalfW, 40, Color.FromArgb(32, 24, 32), Color.FromArgb(244, 114, 182), 8, Color.FromArgb(70, 30, 50));
+            btnRemoveVirtual = new ModernButton("🗑️ Sürücüyü Kaldır", 12 + btnHalfW + 8, 48, btnHalfW, 42, Color.FromArgb(32, 24, 32), Color.FromArgb(244, 114, 182), 8, Color.FromArgb(70, 30, 50));
             btnRemoveVirtual.Font = new Font("Segoe UI", 8.5f, FontStyle.Bold);
             btnRemoveVirtual.Click += BtnRemoveVirtual_Click;
 
             cardVirtual.Controls.Add(btnAddVirtual);
             cardVirtual.Controls.Add(btnRemoveVirtual);
             pnlLeftCol.Controls.Add(cardVirtual);
+
+            // Sol Kart 2: Yansıtılacak Monitör Seçimi (Orta dinamik alan)
+            int screensY = 94;
+            int screensH = Math.Max(120, (colH - cardVirtH - 10) - screensY);
+            cardScreens = new ModernCard("YANSITILACAK MONİTÖR", 0, screensY, colW, screensH);
+            
+            btnRefresh = new ModernButton("🔄 Yenile", colW - 86, 7, 74, 22, Color.FromArgb(28, 36, 54), ColorTextMuted, 5);
+            btnRefresh.Font = new Font("Segoe UI", 7.5f, FontStyle.Bold);
+            btnRefresh.Click += delegate(object s, EventArgs e) { RefreshScreenList(); };
+            cardScreens.Controls.Add(btnRefresh);
+
+            screenSelector = new ModernMonitorSelector(12, 34, colW - 24, Math.Max(60, screensH - 42));
+            screenSelector.SelectionChanged += delegate(int index, Screen scr, bool isVirt)
+            {
+                selectedScreenIndex = index;
+                if (scr != null)
+                {
+                    selectedDeviceName = scr.DeviceName;
+                    AppConfig.LastMonitorDevice = selectedDeviceName;
+                    AppConfig.Save();
+                    Rectangle phys = GetPhysicalMonitorBounds(selectedDeviceName);
+                    currentScreenBounds = (phys.Width > 0 && phys.Height > 0) ? phys : scr.Bounds;
+                }
+            };
+            cardScreens.Controls.Add(screenSelector);
+            pnlLeftCol.Controls.Add(cardScreens);
 
             this.Controls.Add(pnlLeftCol);
 
@@ -1143,8 +1256,8 @@ namespace ScreenMonitoringApp
                 BackColor = ColorBg
             };
 
-            // Sağ Kart 1: Performans & Hız (H=192, Y=0)
-            cardPerf = new ModernCard("AKIŞ VE HIZ LİMİTİ", 0, 0, colW, 192);
+            // Sağ Kart 1: Performans & Hız (H=172, Y=0)
+            cardPerf = new ModernCard("AKIŞ VE HIZ LİMİTİ", 0, 0, colW, 172);
 
             // FPS Satırı
             lblFpsTitle = new Label
@@ -1153,7 +1266,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 ForeColor = ColorTextMuted,
                 BackColor = ColorCard,
-                Location = new Point(12, 26),
+                Location = new Point(12, 25),
                 AutoSize = true
             };
             lblFpsVal = new Label
@@ -1162,7 +1275,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
                 ForeColor = ColorSuccess,
                 BackColor = ColorCard,
-                Location = new Point(colW - 90, 25),
+                Location = new Point(colW - 90, 24),
                 Size = new Size(78, 18),
                 TextAlign = ContentAlignment.MiddleRight
             };
@@ -1171,8 +1284,8 @@ namespace ScreenMonitoringApp
 
             tbFps = new ModernSlider(15, 75, AppConfig.Fps, ColorSuccess, Color.FromArgb(6, 182, 212))
             {
-                Location = new Point(12, 48),
-                Size = new Size(colW - 24, 20)
+                Location = new Point(12, 45),
+                Size = new Size(colW - 24, 18)
             };
             tbFps.ValueChanged += delegate(object s, EventArgs e) { UpdateFps(tbFps.Value); };
             tbFps.MouseUp += delegate(object s, MouseEventArgs e)
@@ -1189,7 +1302,7 @@ namespace ScreenMonitoringApp
             for (int i = 0; i < fpsPresets.Length; i++)
             {
                 int val = fpsPresets[i];
-                QuickChip chip = new QuickChip(val.ToString() + " FPS", 12 + i * (chipW + 3), 74, chipW, 22);
+                QuickChip chip = new QuickChip(val.ToString() + " FPS", 12 + i * (chipW + 3), 67, chipW, 22);
                 chip.Click += delegate(object s, EventArgs e)
                 {
                     tbFps.Value = val;
@@ -1207,7 +1320,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 ForeColor = ColorTextMuted,
                 BackColor = ColorCard,
-                Location = new Point(12, 108),
+                Location = new Point(12, 96),
                 AutoSize = true
             };
             lblQualityVal = new Label
@@ -1216,7 +1329,7 @@ namespace ScreenMonitoringApp
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
                 ForeColor = ColorAccent,
                 BackColor = ColorCard,
-                Location = new Point(colW - 120, 107),
+                Location = new Point(colW - 120, 95),
                 Size = new Size(108, 18),
                 TextAlign = ContentAlignment.MiddleRight
             };
@@ -1225,8 +1338,8 @@ namespace ScreenMonitoringApp
 
             tbQuality = new ModernSlider(15, 100, AppConfig.Quality, ColorPrimary, Color.FromArgb(168, 85, 247))
             {
-                Location = new Point(12, 130),
-                Size = new Size(colW - 24, 20)
+                Location = new Point(12, 116),
+                Size = new Size(colW - 24, 18)
             };
             tbQuality.ValueChanged += delegate(object s, EventArgs e) { UpdateQuality(tbQuality.Value); };
             tbQuality.MouseUp += delegate(object s, MouseEventArgs e)
@@ -1243,7 +1356,7 @@ namespace ScreenMonitoringApp
             for (int i = 0; i < qPresets.Length; i++)
             {
                 int val = qPresets[i];
-                QuickChip chip = new QuickChip(qLabels[i], 12 + i * (chipW + 3), 156, chipW, 22);
+                QuickChip chip = new QuickChip(qLabels[i], 12 + i * (chipW + 3), 138, chipW, 22);
                 chip.Click += delegate(object s, EventArgs e)
                 {
                     tbQuality.Value = val;
@@ -1256,13 +1369,15 @@ namespace ScreenMonitoringApp
 
             pnlRightCol.Controls.Add(cardPerf);
 
-            // Sağ Kart 2: Sistem ve Motor Seçenekleri (H=206, Y=202)
-            cardOpts = new ModernCard("SİSTEM VE OPTİMİZASYONLAR", 0, 202, colW, 206);
+            // Sağ Kart 2: Sistem ve Motor Seçenekleri (H=214, Y=182)
+            int optsY = 182;
+            int optsH = Math.Max(214, colH - optsY);
+            cardOpts = new ModernCard("SİSTEM VE OPTİMİZASYONLAR", 0, optsY, colW, optsH);
 
             swAdaptiveFps = new ModernSwitch(
                 "⚡ " + L10n.T("Akıllı 60 FPS Performans Modu", "Smart 60 FPS Performance Mode"),
                 L10n.T("Yüksek pikselli cihazları 60 FPS'e dengeler (Kapalıyken 1:1)", "Balances high-res devices for 60 FPS (1:1 when off)"),
-                12, 26, colW - 24, 42
+                12, 26, colW - 24, 40
             );
             swAdaptiveFps.Checked = AppConfig.AdaptiveFps;
             swAdaptiveFps.CheckedChanged += delegate(object s, EventArgs e)
@@ -1277,7 +1392,7 @@ namespace ScreenMonitoringApp
             swShowFps = new ModernSwitch(
                 L10n.T("Cihazda Canlı FPS Sayacı Göster", "Show Live FPS Counter on Device"),
                 L10n.T("Sol üst köşede yeşil donanım OSD sayacı gösterir", "Displays green on-screen OSD telemetry counter"),
-                12, 70, colW - 24, 42
+                12, 70, colW - 24, 40
             );
             swShowFps.Checked = AppConfig.ShowFps;
             swShowFps.CheckedChanged += delegate(object s, EventArgs e)
@@ -1292,7 +1407,7 @@ namespace ScreenMonitoringApp
             swBatterySaver = new ModernSwitch(
                 L10n.T("Akıllı Güç ve Veri Tasarrufu", "Smart Power & Data Saver"),
                 L10n.T("Statik ekranda gereksiz veri aktarımını durdurur", "Pauses transmission when screen is static"),
-                12, 114, colW - 24, 42
+                12, 114, colW - 24, 40
             );
             swBatterySaver.Checked = AppConfig.BatterySaver;
             swBatterySaver.CheckedChanged += delegate(object s, EventArgs e)
@@ -1306,7 +1421,7 @@ namespace ScreenMonitoringApp
             swStartup = new ModernSwitch(
                 "🪟 " + L10n.T("Windows ile Birlikte Başlat", "Start with Windows"),
                 L10n.T("PC açılışında arka planda sessizce başlar, bildirimleri yakalar", "Starts silently in tray on boot to capture notifications"),
-                12, 158, colW - 24, 42
+                12, 158, colW - 24, 40
             );
             swStartup.Checked = WindowsStartupManager.IsStartupEnabled();
             swStartup.CheckedChanged += delegate(object s, EventArgs e)
@@ -1326,12 +1441,12 @@ namespace ScreenMonitoringApp
             // ═══════════════════════════════════════════════
             // ALT KOMUTA VE CANLI TELEMETRİ GÜVERTESİ
             // ═══════════════════════════════════════════════
-            int bottomY = colY + colH + 14; // 540
+            int bottomY = colY + colH + 10;
 
             // Büyük Aksiyon Butonu
             btnStartStop = new ModernButton(
                 "▶    EKRAN PAYLAŞIMINI BAŞLAT",
-                18, bottomY, windowW - 36, 50,
+                18, bottomY, windowW - 36, 46,
                 ColorSuccess, Color.FromArgb(11, 15, 25), 10
             );
             btnStartStop.Font = new Font("Segoe UI", 11.5f, FontStyle.Bold);
@@ -1339,8 +1454,8 @@ namespace ScreenMonitoringApp
             this.Controls.Add(btnStartStop);
 
             // Canlı Telemetri Çubuğu
-            pnlBottomBar = new RoundedPanel(windowW - 36, 50, 10, ColorCard, ColorCardBorder);
-            pnlBottomBar.Location = new Point(18, bottomY + 56);
+            pnlBottomBar = new RoundedPanel(windowW - 36, 46, 10, ColorCard, ColorCardBorder);
+            pnlBottomBar.Location = new Point(18, bottomY + 52);
 
             lblStatusDot = new Label
             {
@@ -1439,8 +1554,8 @@ namespace ScreenMonitoringApp
 
             // 3. İki Sütunlu Kart Izgarası
             int colY = 158;
-            int bottomSpace = 124; // btnStartStop(50) + pnlBottomBar(50) + boşluklar(24)
-            int colH = Math.Max(370, h - colY - bottomSpace);
+            int bottomSpace = 118; // btnStartStop(46) + pnlBottomBar(46) + boşluklar
+            int colH = Math.Max(396, h - colY - bottomSpace);
             int colW = Math.Max(350, (w - 36 - 16) / 2);
 
             // Sol Panel
@@ -1450,11 +1565,11 @@ namespace ScreenMonitoringApp
             if (cardMode != null)
             {
                 cardMode.Location = new Point(0, 0);
-                cardMode.Size = new Size(colW, 86);
+                cardMode.Size = new Size(colW, 84);
                 if (modeControl != null)
                 {
-                    modeControl.Location = new Point(12, 30);
-                    modeControl.Size = new Size(colW - 24, 42);
+                    modeControl.Location = new Point(12, 28);
+                    modeControl.Size = new Size(colW - 24, 44);
                 }
             }
 
@@ -1474,19 +1589,19 @@ namespace ScreenMonitoringApp
                 int btnHalfW = (colW - 24 - 8) / 2;
                 if (btnAddVirtual != null)
                 {
-                    btnAddVirtual.Location = new Point(12, 50);
-                    btnAddVirtual.Size = new Size(btnHalfW, 40);
+                    btnAddVirtual.Location = new Point(12, 48);
+                    btnAddVirtual.Size = new Size(btnHalfW, 42);
                 }
                 if (btnRemoveVirtual != null)
                 {
-                    btnRemoveVirtual.Location = new Point(12 + btnHalfW + 8, 50);
-                    btnRemoveVirtual.Size = new Size(btnHalfW, 40);
+                    btnRemoveVirtual.Location = new Point(12 + btnHalfW + 8, 48);
+                    btnRemoveVirtual.Size = new Size(btnHalfW, 42);
                 }
             }
 
             if (cardScreens != null)
             {
-                int screensY = 96;
+                int screensY = 94;
                 int screensH = Math.Max(120, (colH - cardVirtH - 10) - screensY);
                 cardScreens.Location = new Point(0, screensY);
                 cardScreens.Size = new Size(colW, screensH);
@@ -1497,7 +1612,7 @@ namespace ScreenMonitoringApp
                 if (screenSelector != null)
                 {
                     screenSelector.Location = new Point(12, 34);
-                    screenSelector.Size = new Size(colW - 24, Math.Max(60, screensH - 44));
+                    screenSelector.Size = new Size(colW - 24, Math.Max(60, screensH - 42));
                 }
             }
 
@@ -1520,29 +1635,37 @@ namespace ScreenMonitoringApp
             if (cardPerf != null)
             {
                 cardPerf.Location = new Point(0, 0);
-                cardPerf.Size = new Size(colW, 192);
+                cardPerf.Size = new Size(colW, 172);
 
-                if (lblFpsVal != null) lblFpsVal.Location = new Point(colW - 90, 25);
-                if (tbFps != null) tbFps.Size = new Size(colW - 24, 20);
+                if (lblFpsVal != null) lblFpsVal.Location = new Point(colW - 90, 24);
+                if (tbFps != null)
+                {
+                    tbFps.Location = new Point(12, 45);
+                    tbFps.Size = new Size(colW - 24, 18);
+                }
 
                 int chipW = (colW - 24 - 9) / 4;
                 if (fpsChips != null)
                 {
                     for (int i = 0; i < fpsChips.Count; i++)
                     {
-                        fpsChips[i].Location = new Point(12 + i * (chipW + 3), 74);
+                        fpsChips[i].Location = new Point(12 + i * (chipW + 3), 67);
                         fpsChips[i].Size = new Size(chipW, 22);
                     }
                 }
 
-                if (lblQualityVal != null) lblQualityVal.Location = new Point(colW - 120, 107);
-                if (tbQuality != null) tbQuality.Size = new Size(colW - 24, 20);
+                if (lblQualityVal != null) lblQualityVal.Location = new Point(colW - 120, 95);
+                if (tbQuality != null)
+                {
+                    tbQuality.Location = new Point(12, 116);
+                    tbQuality.Size = new Size(colW - 24, 18);
+                }
 
                 if (qualityChips != null)
                 {
                     for (int i = 0; i < qualityChips.Count; i++)
                     {
-                        qualityChips[i].Location = new Point(12 + i * (chipW + 3), 156);
+                        qualityChips[i].Location = new Point(12 + i * (chipW + 3), 138);
                         qualityChips[i].Size = new Size(chipW, 22);
                     }
                 }
@@ -1550,40 +1673,40 @@ namespace ScreenMonitoringApp
 
             if (cardOpts != null)
             {
-                int optsY = 202;
-                int optsH = Math.Max(206, colH - optsY);
+                int optsY = 182;
+                int optsH = Math.Max(214, colH - optsY);
                 cardOpts.Location = new Point(0, optsY);
                 cardOpts.Size = new Size(colW, optsH);
 
                 if (swAdaptiveFps != null)
                 {
                     swAdaptiveFps.Location = new Point(12, 26);
-                    swAdaptiveFps.Size = new Size(colW - 24, 42);
+                    swAdaptiveFps.Size = new Size(colW - 24, 40);
                 }
                 if (swShowFps != null)
                 {
                     swShowFps.Location = new Point(12, 70);
-                    swShowFps.Size = new Size(colW - 24, 42);
+                    swShowFps.Size = new Size(colW - 24, 40);
                 }
                 if (swBatterySaver != null)
                 {
                     swBatterySaver.Location = new Point(12, 114);
-                    swBatterySaver.Size = new Size(colW - 24, 42);
+                    swBatterySaver.Size = new Size(colW - 24, 40);
                 }
                 if (swStartup != null)
                 {
                     swStartup.Location = new Point(12, 158);
-                    swStartup.Size = new Size(colW - 24, 42);
+                    swStartup.Size = new Size(colW - 24, 40);
                 }
             }
 
             // 4. Alt Komuta ve Canlı Telemetri Güvertesi
-            int bottomY = colY + colH + 12;
+            int bottomY = colY + colH + 10;
             btnStartStop.Location = new Point(18, bottomY);
-            btnStartStop.Size = new Size(w - 36, 50);
+            btnStartStop.Size = new Size(w - 36, 46);
 
-            pnlBottomBar.Location = new Point(18, bottomY + 56);
-            pnlBottomBar.Size = new Size(w - 36, 50);
+            pnlBottomBar.Location = new Point(18, bottomY + 52);
+            pnlBottomBar.Size = new Size(w - 36, 46);
 
             int barW = w - 36;
             if (badgeLatency != null) badgeLatency.Location = new Point(barW - 86, 11);
@@ -1653,8 +1776,8 @@ namespace ScreenMonitoringApp
                 try
                 {
                     MINMAXINFO mmi = (MINMAXINFO)Marshal.PtrToStructure(m.LParam, typeof(MINMAXINFO));
-                    mmi.ptMinTrackSize.x = 780;
-                    mmi.ptMinTrackSize.y = 672;
+                    mmi.ptMinTrackSize.x = 860;
+                    mmi.ptMinTrackSize.y = 680;
                     Marshal.StructureToPtr(mmi, m.LParam, true);
                     m.Result = IntPtr.Zero;
                     return;
@@ -1667,8 +1790,8 @@ namespace ScreenMonitoringApp
                 try
                 {
                     RECT suggested = (RECT)Marshal.PtrToStructure(m.LParam, typeof(RECT));
-                    int newW = Math.Max(780, suggested.right - suggested.left);
-                    int newH = Math.Max(672, suggested.bottom - suggested.top);
+                    int newW = Math.Max(860, suggested.right - suggested.left);
+                    int newH = Math.Max(680, suggested.bottom - suggested.top);
                     SetWindowPos(this.Handle, IntPtr.Zero, suggested.left, suggested.top, newW, newH, SWP_NOZORDER | SWP_NOACTIVATE);
                     LayoutStudioUI();
                 }
@@ -3321,14 +3444,11 @@ namespace ScreenMonitoringApp
             hasShownInitial = true;
             startMinimized = false;
             this.ShowInTaskbar = true;
+            this.WindowState = FormWindowState.Normal;
             if (!this.Visible)
             {
                 this.Visible = true;
                 this.Show();
-            }
-            if (this.WindowState == FormWindowState.Minimized)
-            {
-                this.WindowState = FormWindowState.Normal;
             }
             this.ShowInTaskbar = true;
             try
@@ -3342,6 +3462,7 @@ namespace ScreenMonitoringApp
             catch { }
             this.Activate();
             this.BringToFront();
+            LayoutStudioUI();
             this.Invalidate(true);
         }
 
@@ -5223,6 +5344,237 @@ namespace ScreenMonitoringApp
         }
     }
 
+    public class ModernDarkScrollBar : Control
+    {
+        private int minimum = 0;
+        private int maximum = 100;
+        private int val = 0;
+        private int smallChange = 40;
+        private int largeChange = 100;
+
+        private bool isHovered = false;
+        private bool isDragging = false;
+        private int dragStartY = 0;
+        private int dragStartVal = 0;
+
+        public event EventHandler ValueChanged;
+
+        public ModernDarkScrollBar()
+        {
+            this.SetStyle(ControlStyles.AllPaintingInWmPaint |
+                          ControlStyles.UserPaint |
+                          ControlStyles.OptimizedDoubleBuffer |
+                          ControlStyles.ResizeRedraw |
+                          ControlStyles.SupportsTransparentBackColor, true);
+            this.DoubleBuffered = true;
+            this.Width = 10;
+            this.BackColor = MainForm.ColorBg;
+            this.Cursor = Cursors.Default;
+        }
+
+        public int Minimum
+        {
+            get { return minimum; }
+            set { minimum = value; Invalidate(); }
+        }
+
+        public int Maximum
+        {
+            get { return maximum; }
+            set
+            {
+                maximum = value;
+                this.Value = val;
+                Invalidate();
+            }
+        }
+
+        public int SmallChange
+        {
+            get { return smallChange; }
+            set { smallChange = value; }
+        }
+
+        public int LargeChange
+        {
+            get { return largeChange; }
+            set
+            {
+                largeChange = value;
+                this.Value = val;
+                Invalidate();
+            }
+        }
+
+        public int Value
+        {
+            get { return val; }
+            set
+            {
+                int maxPossible = Math.Max(minimum, maximum - largeChange);
+                int clamped = Math.Max(minimum, Math.Min(maxPossible, value));
+                if (val != clamped)
+                {
+                    val = clamped;
+                    Invalidate();
+                    if (ValueChanged != null)
+                    {
+                        ValueChanged(this, EventArgs.Empty);
+                    }
+                }
+            }
+        }
+
+        private Rectangle GetThumbRect()
+        {
+            int trackH = this.Height;
+            if (trackH <= 0) return Rectangle.Empty;
+
+            int totalRange = Math.Max(1, maximum - minimum);
+            int viewRange = Math.Min(totalRange, Math.Max(1, largeChange));
+            float ratio = (float)viewRange / (float)totalRange;
+            int thumbH = Math.Max(32, (int)(trackH * ratio));
+            if (thumbH > trackH) thumbH = trackH;
+
+            int maxVal = Math.Max(1, maximum - largeChange - minimum);
+            int curOffset = val - minimum;
+            int trackTravel = trackH - thumbH;
+            int thumbY = (trackTravel > 0) ? (int)((float)curOffset / maxVal * trackTravel) : 0;
+            thumbY = Math.Max(0, Math.Min(trackTravel, thumbY));
+
+            return new Rectangle(1, thumbY, this.Width - 2, thumbH);
+        }
+
+        internal Rectangle GetThumbRectForTest()
+        {
+            return GetThumbRect();
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            base.OnMouseEnter(e);
+            isHovered = true;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (!isDragging)
+            {
+                isHovered = false;
+                Invalidate();
+            }
+        }
+
+        protected override void OnMouseDown(MouseEventArgs e)
+        {
+            base.OnMouseDown(e);
+            if (e.Button == MouseButtons.Left)
+            {
+                Rectangle thumbRect = GetThumbRect();
+                if (thumbRect.Contains(e.Location))
+                {
+                    isDragging = true;
+                    this.Capture = true;
+                    dragStartY = e.Y;
+                    dragStartVal = val;
+                }
+                else
+                {
+                    if (e.Y < thumbRect.Top)
+                    {
+                        this.Value -= largeChange;
+                    }
+                    else if (e.Y > thumbRect.Bottom)
+                    {
+                        this.Value += largeChange;
+                    }
+                }
+            }
+        }
+
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            base.OnMouseMove(e);
+            if (isDragging)
+            {
+                Rectangle thumbRect = GetThumbRect();
+                int trackTravel = this.Height - thumbRect.Height;
+                if (trackTravel > 0)
+                {
+                    int maxVal = Math.Max(1, maximum - largeChange - minimum);
+                    int deltaY = e.Y - dragStartY;
+                    int deltaVal = (int)((float)deltaY / trackTravel * maxVal);
+                    this.Value = dragStartVal + deltaVal;
+                }
+            }
+        }
+
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (isDragging)
+            {
+                this.Capture = false;
+                isDragging = false;
+                Point cursorP = this.PointToClient(Cursor.Position);
+                isHovered = this.ClientRectangle.Contains(cursorP);
+                Invalidate();
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            // Arka plan / Track: İnce koyu ray
+            int trackW = 4;
+            int trackX = (this.Width - trackW) / 2;
+            using (Brush trackBrush = new SolidBrush(Color.FromArgb(24, 33, 50)))
+            {
+                using (GraphicsPath trackPath = RoundedPanel.CreateRoundedRect(new Rectangle(trackX, 2, trackW, Math.Max(1, this.Height - 4)), 2))
+                {
+                    g.FillPath(trackBrush, trackPath);
+                }
+            }
+
+            // Thumb: Modern hap (pill) biçiminde
+            Rectangle thumbRect = GetThumbRect();
+            if (thumbRect.Width > 0 && thumbRect.Height > 0)
+            {
+                Color thumbColor;
+                if (isDragging)
+                {
+                    thumbColor = Color.FromArgb(59, 130, 246); // MobiDesk Royal Blue
+                }
+                else if (isHovered)
+                {
+                    thumbColor = Color.FromArgb(100, 116, 139); // Slate-500 hover
+                }
+                else
+                {
+                    thumbColor = Color.FromArgb(71, 85, 105);   // Slate-600 visible dark
+                }
+
+                int pillW = 6;
+                int pillX = (this.Width - pillW) / 2;
+                Rectangle pillRect = new Rectangle(pillX, thumbRect.Y, pillW, thumbRect.Height);
+                int radius = pillW / 2;
+
+                using (Brush thumbBrush = new SolidBrush(thumbColor))
+                {
+                    using (GraphicsPath pillPath = RoundedPanel.CreateRoundedRect(pillRect, radius))
+                    {
+                        g.FillPath(thumbBrush, pillPath);
+                    }
+                }
+            }
+        }
+    }
+
     public class LanguageToggle : Control
     {
         private bool isEnglish = false;
@@ -6134,8 +6486,9 @@ namespace ScreenMonitoringApp
         public static bool BatterySaver = false;
         public static bool IsExtendMode = true;
         public static string LastMonitorDevice = "";
-        public static int WindowWidth = 780;
-        public static int WindowHeight = 672;
+        public static int WindowWidth = 860;
+        public static int WindowHeight = 680;
+        public static bool MockNotifications = false;
 
         public static void Load()
         {
@@ -6186,6 +6539,12 @@ namespace ScreenMonitoringApp
                                     if (bool.TryParse(val, out battVal))
                                         BatterySaver = battVal;
                                     break;
+                                case "mock":
+                                case "mock_notifications":
+                                    bool mockVal;
+                                    if (bool.TryParse(val, out mockVal))
+                                        MockNotifications = mockVal;
+                                    break;
                                 case "is_extend_mode":
                                 case "mode":
                                     if (val.Equals("mirror", StringComparison.OrdinalIgnoreCase) || val.Equals("duplicate", StringComparison.OrdinalIgnoreCase) || val.Equals("false", StringComparison.OrdinalIgnoreCase))
@@ -6200,12 +6559,12 @@ namespace ScreenMonitoringApp
                                 case "window_w":
                                     int w;
                                     if (int.TryParse(val, out w))
-                                        WindowWidth = Math.Max(780, w);
+                                        WindowWidth = Math.Max(860, w);
                                     break;
                                 case "window_h":
                                     int h;
                                     if (int.TryParse(val, out h))
-                                        WindowHeight = Math.Max(672, h);
+                                        WindowHeight = Math.Max(680, h);
                                     break;
                             }
                         }
@@ -7216,7 +7575,9 @@ namespace ScreenMonitoringApp
         private MobiFlowManager flowManager;
         private Panel pnlHeader;
         private Panel pnlBottom;
-        private Panel pnlMessages;
+        internal Panel pnlFlowViewport;
+        internal DoubleBufferedPanel pnlMessages;
+        internal ModernDarkScrollBar vScrollBar;
         private TextBox txtInput;
         private ModernButton btnSend;
         private ModernButton btnSendFile;
@@ -7379,20 +7740,65 @@ namespace ScreenMonitoringApp
 
             UpdateHeaderPositions();
 
-            // 3. Orta Mesaj Alanı
-            pnlMessages = new Panel
+            // 3. Mesaj Görünüm Alanı (Viewport + Content)
+            int viewportH = Math.Max(50, h - 44 - bottomH - 2);
+            pnlFlowViewport = new Panel
             {
                 Location = new Point(0, 44),
-                Size = new Size(w, h - 44 - bottomH - 2),
-                AutoScroll = true,
+                Size = new Size(w, viewportH),
+                AutoScroll = false,
+                BackColor = MainForm.ColorBg
+            };
+
+            pnlMessages = new DoubleBufferedPanel
+            {
+                Location = new Point(0, 0),
+                Size = new Size(w, viewportH),
                 BackColor = MainForm.ColorBg,
                 AllowDrop = true
             };
-            this.Controls.Add(pnlMessages);
+            pnlFlowViewport.Controls.Add(pnlMessages);
+            this.Controls.Add(pnlFlowViewport);
+
+            // 4. Modern Koyu Kaydırma Çubuğu (Custom Dark ScrollBar)
+            vScrollBar = new ModernDarkScrollBar
+            {
+                Location = new Point(w - 14, 48),
+                Size = new Size(10, Math.Max(20, viewportH - 8)),
+                Visible = false
+            };
+            vScrollBar.ValueChanged += delegate
+            {
+                pnlMessages.Top = -vScrollBar.Value;
+            };
+            this.Controls.Add(vScrollBar);
+            vScrollBar.BringToFront();
+
+            // Fare Tekerleği Desteği (Mouse Wheel)
+            AttachWheel(pnlFlowViewport);
+            AttachWheel(pnlMessages);
 
             // Sürükle-Bırak Olayları
             SetupDragAndDrop(this);
+            SetupDragAndDrop(pnlFlowViewport);
             SetupDragAndDrop(pnlMessages);
+        }
+
+        private void AttachWheel(Control c)
+        {
+            if (c == null) return;
+            c.MouseWheel += delegate(object s, MouseEventArgs e)
+            {
+                if (vScrollBar != null && vScrollBar.Visible)
+                {
+                    int step = (e.Delta < 0) ? 60 : -60;
+                    vScrollBar.Value += step;
+                }
+            };
+            foreach (Control child in c.Controls)
+            {
+                AttachWheel(child);
+            }
         }
 
         public void UpdateDeviceList(List<ConnectedDeviceItem> devices)
@@ -7496,10 +7902,85 @@ namespace ScreenMonitoringApp
                 }
             }
 
-            if (pnlMessages != null)
+            int scrollBarW = 10;
+            int viewportY = headerH + 2;
+            int viewportH = Math.Max(50, curH - headerH - bottomH - 4);
+
+            if (vScrollBar != null)
             {
-                pnlMessages.Location = new Point(0, headerH + 2);
-                pnlMessages.Size = new Size(curW, Math.Max(50, curH - headerH - bottomH - 4));
+                vScrollBar.Location = new Point(curW - scrollBarW - 2, viewportY + 2);
+                vScrollBar.Size = new Size(scrollBarW, Math.Max(20, viewportH - 4));
+            }
+
+            if (pnlFlowViewport != null)
+            {
+                int vpW = curW - (vScrollBar != null && vScrollBar.Visible ? (scrollBarW + 4) : 0);
+                pnlFlowViewport.Location = new Point(0, viewportY);
+                pnlFlowViewport.Size = new Size(vpW, viewportH);
+            }
+
+            UpdateScrollBounds(false);
+        }
+
+        public void UpdateScrollBounds(bool scrollToBottom)
+        {
+            if (pnlFlowViewport == null || pnlMessages == null) return;
+
+            int viewportH = pnlFlowViewport.ClientSize.Height;
+            if (viewportH <= 0) return;
+
+            int lastY = 10;
+            foreach (Control c in pnlMessages.Controls)
+            {
+                if (c.Bottom > lastY)
+                {
+                    lastY = c.Bottom;
+                }
+            }
+            int totalContentH = Math.Max(viewportH, lastY + 16);
+            pnlMessages.Height = totalContentH;
+
+            bool needsScroll = (pnlMessages.Controls.Count > 0 && lastY + 16 > viewportH);
+            if (vScrollBar != null)
+            {
+                vScrollBar.Visible = needsScroll;
+            }
+
+            int scrollBarW = 10;
+            int vpW = this.ClientSize.Width - (vScrollBar != null && vScrollBar.Visible ? (scrollBarW + 4) : 0);
+            pnlFlowViewport.Size = new Size(vpW, viewportH);
+            pnlMessages.Width = vpW;
+
+            // PC tarafı mesaj balonlarını (sağa yaslı) güncel viewport genişliğine uyarla
+            foreach (Control c in pnlMessages.Controls)
+            {
+                bool isMe = string.Equals(c.AccessibleName, "ME", StringComparison.OrdinalIgnoreCase);
+                if (isMe)
+                {
+                    c.Location = new Point(Math.Max(12, vpW - c.Width - 14), c.Top);
+                }
+            }
+
+            if (vScrollBar != null && vScrollBar.Visible)
+            {
+                vScrollBar.Minimum = 0;
+                vScrollBar.Maximum = totalContentH;
+                vScrollBar.LargeChange = viewportH;
+                int maxVal = Math.Max(0, totalContentH - viewportH);
+                if (scrollToBottom)
+                {
+                    vScrollBar.Value = maxVal;
+                }
+                else
+                {
+                    if (vScrollBar.Value > maxVal) vScrollBar.Value = maxVal;
+                }
+                pnlMessages.Top = -vScrollBar.Value;
+            }
+            else
+            {
+                if (vScrollBar != null) vScrollBar.Value = 0;
+                pnlMessages.Top = 0;
             }
         }
 
@@ -7615,19 +8096,28 @@ namespace ScreenMonitoringApp
             {
                 if (ShouldShowMessage(m))
                 {
-                    RenderMessageBubble(m);
+                    RenderMessageBubble(m, false);
                 }
             }
             pnlMessages.ResumeLayout(true);
+            UpdateScrollBounds(true);
         }
 
         private void RenderMessageBubble(FlowMessageItem item)
         {
+            RenderMessageBubble(item, true);
+        }
+
+        private void RenderMessageBubble(FlowMessageItem item, bool updateScroll)
+        {
             bool isMe = (item.Sender == "pc");
-            int panelW = pnlMessages.ClientSize.Width - 24;
-            int bubbleMaxW = Math.Max(260, (int)(panelW * 0.70f));
+            int curW = pnlFlowViewport != null ? pnlFlowViewport.ClientSize.Width : (this.ClientSize.Width - 14);
+            if (curW <= 0) curW = 400;
+            int panelW = curW - 24;
+            int bubbleMaxW = Math.Max(240, (int)(panelW * 0.70f));
 
             Panel bubble = new Panel();
+            bubble.AccessibleName = isMe ? "ME" : "OTHER";
             bubble.BackColor = isMe ? Color.FromArgb(29, 78, 216) : MainForm.ColorCard;
             bubble.Padding = new Padding(10, 8, 10, 8);
             bubble.Tag = item.Id;
@@ -7745,11 +8235,17 @@ namespace ScreenMonitoringApp
                 lastY = lastC.Bottom + 10;
             }
 
-            int bubbleX = isMe ? (panelW - bubble.Width) : 12;
+            int bubbleX = isMe ? Math.Max(12, curW - bubble.Width - 14) : 12;
             bubble.Location = new Point(bubbleX, lastY);
 
+            AttachWheel(bubble);
+            SetupDragAndDrop(bubble);
             pnlMessages.Controls.Add(bubble);
-            pnlMessages.ScrollControlIntoView(bubble);
+
+            if (updateScroll)
+            {
+                UpdateScrollBounds(true);
+            }
         }
 
         public void UpdateFileProgress(FlowMessageItem item)
@@ -7775,25 +8271,74 @@ namespace ScreenMonitoringApp
         }
     }
 
+    public class NotificationCardControl : DoubleBufferedPanel
+    {
+        private bool isHovered = false;
+        private static readonly Color BgColor = Color.FromArgb(17, 24, 39);      // #111827
+        private static readonly Color BorderNormal = Color.FromArgb(30, 41, 59); // #1E293B
+        private static readonly Color BorderHover = Color.FromArgb(59, 130, 246); // #3B82F6
+
+        public NotificationCardControl()
+        {
+            this.DoubleBuffered = true;
+            this.BackColor = BgColor;
+            this.SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            this.MouseEnter += delegate { isHovered = true; this.Invalidate(); };
+            this.MouseLeave += delegate { isHovered = false; this.Invalidate(); };
+        }
+
+        public void SetHover(bool h)
+        {
+            if (isHovered != h)
+            {
+                isHovered = h;
+                this.Invalidate();
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            Graphics g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            Rectangle rect = new Rectangle(0, 0, this.Width - 1, this.Height - 1);
+            using (GraphicsPath path = RoundedPanel.CreateRoundedRect(rect, 8))
+            {
+                using (SolidBrush b = new SolidBrush(BgColor))
+                {
+                    g.FillPath(b, path);
+                }
+                Color bCol = isHovered ? BorderHover : BorderNormal;
+                using (Pen p = new Pen(bCol, 1.2f))
+                {
+                    g.DrawPath(p, path);
+                }
+            }
+        }
+    }
+
     public class MobiNotificationsPanel : DoubleBufferedPanel
     {
-        private MobiFlowManager flowManager;
-        private Panel pnlHeader;
-        private ModernButton btnClearAll;
-        private ModernButton btnStartupToggle;
-        private Panel pnlNotifsList;
-        private Label lblTitle;
-        private Label lblCount;
-        private Label lblStatusDot;
-        private Label lblStatusText;
-        private Label lblEmptyHint;
-        private Label lblFilterLabel;
-        private ModernComboBox cbDeviceFilter;
+        internal MobiFlowManager flowManager;
+        internal Panel pnlHeader;
+        internal ModernButton btnClearAll;
+        internal ModernButton btnStartupToggle;
+        internal Panel pnlNotifsViewport;
+        internal DoubleBufferedPanel pnlNotifsContent;
+        internal ModernDarkScrollBar vScrollBar;
+        internal Label lblTitle;
+        internal Label lblCount;
+        internal Label lblStatusDot;
+        internal Label lblStatusText;
+        internal Label lblEmptyHint;
+        internal ModernComboBox cbDeviceFilter;
 
-        private readonly Dictionary<string, Control> cardMap = new Dictionary<string, Control>();
-        private readonly Dictionary<string, NotificationCardItem> notifItems = new Dictionary<string, NotificationCardItem>();
-        private readonly List<ConnectedDeviceItem> knownDevices = new List<ConnectedDeviceItem>();
-        private string currentFilterSerial = null;
+        internal readonly Dictionary<string, Control> cardMap = new Dictionary<string, Control>();
+        internal readonly Dictionary<string, NotificationCardItem> notifItems = new Dictionary<string, NotificationCardItem>();
+        internal readonly List<ConnectedDeviceItem> knownDevices = new List<ConnectedDeviceItem>();
+        internal string currentFilterSerial = null;
 
         public MobiNotificationsPanel(int x, int y, int width, int height, MobiFlowManager manager)
         {
@@ -7823,7 +8368,7 @@ namespace ScreenMonitoringApp
 
             lblTitle = new Label
             {
-                Text = L10n.T("🔔 Mobil Bildirim Aynalama", "🔔 Mobile Notification Mirroring"),
+                Text = L10n.T("🔔 Bildirimler", "🔔 Notifications"),
                 Font = new Font("Segoe UI", 10.0f, FontStyle.Bold),
                 ForeColor = MainForm.ColorText,
                 Location = new Point(12, 10),
@@ -7833,7 +8378,7 @@ namespace ScreenMonitoringApp
 
             lblCount = new Label
             {
-                Text = string.Format("(0 {0})", L10n.T("Bildirim", "Notifications")),
+                Text = "(0)",
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Regular),
                 ForeColor = MainForm.ColorTextMuted,
                 Location = new Point(lblTitle.Right + 8, 11),
@@ -7846,7 +8391,7 @@ namespace ScreenMonitoringApp
                 Text = "●",
                 Font = new Font("Segoe UI", 10.0f, FontStyle.Bold),
                 ForeColor = MainForm.ColorTextMuted,
-                Location = new Point(lblCount.Right + 10, 10),
+                Location = new Point(lblCount.Right + 8, 10),
                 AutoSize = true
             };
             pnlHeader.Controls.Add(lblStatusDot);
@@ -7861,20 +8406,10 @@ namespace ScreenMonitoringApp
             };
             pnlHeader.Controls.Add(lblStatusText);
 
-            lblFilterLabel = new Label
-            {
-                Text = L10n.T("Filtrele:", "Filter:"),
-                Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
-                ForeColor = MainForm.ColorTextMuted,
-                Location = new Point(lblStatusText.Right + 12, 12),
-                AutoSize = true
-            };
-            pnlHeader.Controls.Add(lblFilterLabel);
-
             cbDeviceFilter = new ModernComboBox
             {
-                Location = new Point(lblFilterLabel.Right + 8, 7),
-                Size = new Size(200, 28)
+                Location = new Point(lblStatusText.Right + 12, 7),
+                Size = new Size(160, 28)
             };
             cbDeviceFilter.Items.Add(L10n.T("🌐 Tüm Cihazlar", "🌐 All Devices"));
             cbDeviceFilter.SelectedIndex = 0;
@@ -7893,7 +8428,7 @@ namespace ScreenMonitoringApp
             };
             pnlHeader.Controls.Add(cbDeviceFilter);
 
-            btnStartupToggle = new ModernButton("", w - 340, 7, 184, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
+            btnStartupToggle = new ModernButton("", w - 280, 7, 145, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
             btnStartupToggle.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
             UpdateStartupButtonText();
             btnStartupToggle.Click += delegate
@@ -7904,29 +8439,65 @@ namespace ScreenMonitoringApp
             };
             pnlHeader.Controls.Add(btnStartupToggle);
 
-            btnClearAll = new ModernButton(L10n.T("🗑️ Tümünü Temizle", "🗑️ Clear All"), w - 150, 7, 138, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
+            btnClearAll = new ModernButton(L10n.T("🗑️ Tümünü Temizle", "🗑️ Clear All"), w - 122, 7, 114, 28, Color.FromArgb(28, 38, 58), MainForm.ColorText, 6);
             btnClearAll.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
             btnClearAll.Click += delegate
             {
                 cardMap.Clear();
                 notifItems.Clear();
-                pnlNotifsList.Controls.Clear();
-                pnlNotifsList.Controls.Add(lblEmptyHint);
-                lblEmptyHint.Visible = true;
+                List<Control> toRemove = new List<Control>();
+                foreach (Control c in pnlNotifsContent.Controls)
+                {
+                    if (c != lblEmptyHint) toRemove.Add(c);
+                }
+                foreach (Control c in toRemove)
+                {
+                    pnlNotifsContent.Controls.Remove(c);
+                    c.Dispose();
+                }
+                RearrangeCards();
                 UpdateCount();
             };
             pnlHeader.Controls.Add(btnClearAll);
             this.Controls.Add(pnlHeader);
 
-            // 2. Bildirimler Listesi
-            pnlNotifsList = new Panel
+            // 2. Bildirimler Görünüm Alanı (Viewport + Content)
+            pnlNotifsViewport = new Panel
             {
                 Location = new Point(0, 44),
-                Size = new Size(w, h - 46),
-                AutoScroll = true,
+                Size = new Size(w, Math.Max(50, h - 46)),
+                AutoScroll = false,
                 BackColor = MainForm.ColorBg
             };
 
+            pnlNotifsContent = new DoubleBufferedPanel
+            {
+                Location = new Point(0, 0),
+                Size = new Size(w, Math.Max(50, h - 46)),
+                BackColor = MainForm.ColorBg
+            };
+            pnlNotifsViewport.Controls.Add(pnlNotifsContent);
+            this.Controls.Add(pnlNotifsViewport);
+
+            // 3. Modern Koyu Kaydırma Çubuğu (Custom Dark ScrollBar)
+            vScrollBar = new ModernDarkScrollBar
+            {
+                Location = new Point(w - 14, 48),
+                Size = new Size(10, Math.Max(50, h - 54)),
+                Visible = false
+            };
+            vScrollBar.ValueChanged += delegate
+            {
+                pnlNotifsContent.Top = -vScrollBar.Value;
+            };
+            this.Controls.Add(vScrollBar);
+            vScrollBar.BringToFront();
+
+            // Fare Tekerleği Desteği (Mouse Wheel)
+            AttachWheel(pnlNotifsViewport);
+            AttachWheel(pnlNotifsContent);
+
+            // Boş Bildirim İpucu
             lblEmptyHint = new Label
             {
                 Text = L10n.T(
@@ -7940,16 +8511,32 @@ namespace ScreenMonitoringApp
                 Location = new Point(20, 60),
                 Visible = true
             };
-            pnlNotifsList.Controls.Add(lblEmptyHint);
-            this.Controls.Add(pnlNotifsList);
+            pnlNotifsContent.Controls.Add(lblEmptyHint);
+            lblEmptyHint.BringToFront();
 
             UpdateHeaderPositions();
         }
 
+        private void AttachWheel(Control c)
+        {
+            if (c == null) return;
+            c.MouseWheel += delegate(object s, MouseEventArgs e)
+            {
+                if (vScrollBar != null && vScrollBar.Visible)
+                {
+                    int step = (e.Delta < 0) ? 60 : -60;
+                    vScrollBar.Value += step;
+                }
+            };
+            foreach (Control child in c.Controls)
+            {
+                AttachWheel(child);
+            }
+        }
+
         public void ApplyLanguage()
         {
-            if (lblTitle != null) lblTitle.Text = L10n.T("🔔 Mobil Bildirim Aynalama", "🔔 Mobile Notification Mirroring");
-            if (lblFilterLabel != null) lblFilterLabel.Text = L10n.T("Filtrele:", "Filter:");
+            if (lblTitle != null) lblTitle.Text = L10n.T("🔔 Bildirimler", "🔔 Notifications");
             if (btnClearAll != null) btnClearAll.Text = L10n.T("🗑️ Tümünü Temizle", "🗑️ Clear All");
             UpdateStartupButtonText();
             if (lblEmptyHint != null)
@@ -7982,12 +8569,46 @@ namespace ScreenMonitoringApp
 
         private void UpdateHeaderPositions()
         {
-            if (lblTitle == null || lblCount == null || lblStatusDot == null || lblStatusText == null || lblFilterLabel == null || cbDeviceFilter == null) return;
-            lblCount.Location = new Point(lblTitle.Right + 8, 11);
-            lblStatusDot.Location = new Point(lblCount.Right + 10, 10);
-            lblStatusText.Location = new Point(lblStatusDot.Right + 2, 12);
-            lblFilterLabel.Location = new Point(lblStatusText.Right + 12, 12);
-            cbDeviceFilter.Location = new Point(lblFilterLabel.Right + 8, 7);
+            if (pnlHeader == null || lblTitle == null || lblCount == null || lblStatusDot == null || lblStatusText == null || cbDeviceFilter == null || btnClearAll == null || btnStartupToggle == null) return;
+
+            int curW = pnlHeader.ClientSize.Width;
+            int rightMargin = 12;
+
+            btnClearAll.Location = new Point(curW - btnClearAll.Width - rightMargin, 7);
+            btnStartupToggle.Location = new Point(btnClearAll.Left - btnStartupToggle.Width - 8, 7);
+
+            int maxLeftX = btnStartupToggle.Left - 12;
+
+            int leftX = 12;
+            lblTitle.Location = new Point(leftX, 10);
+            leftX += lblTitle.Width + 6;
+
+            lblCount.Location = new Point(leftX, 11);
+            leftX += lblCount.Width + 6;
+
+            lblStatusDot.Location = new Point(leftX, 10);
+            leftX += lblStatusDot.Width + 2;
+
+            lblStatusText.Location = new Point(leftX, 12);
+            leftX += lblStatusText.Width + 10;
+
+            int availFilterW = maxLeftX - leftX;
+            if (availFilterW >= 130)
+            {
+                cbDeviceFilter.Visible = true;
+                cbDeviceFilter.Location = new Point(leftX, 7);
+                cbDeviceFilter.Width = Math.Min(170, availFilterW);
+            }
+            else if (availFilterW >= 80)
+            {
+                cbDeviceFilter.Visible = true;
+                cbDeviceFilter.Location = new Point(leftX, 7);
+                cbDeviceFilter.Width = availFilterW;
+            }
+            else
+            {
+                cbDeviceFilter.Visible = false;
+            }
         }
 
         public void UpdateDeviceList(List<ConnectedDeviceItem> devices)
@@ -8035,7 +8656,8 @@ namespace ScreenMonitoringApp
 
         private void ApplyFilter()
         {
-            pnlNotifsList.SuspendLayout();
+            if (pnlNotifsContent == null) return;
+            pnlNotifsContent.SuspendLayout();
             foreach (var kvp in cardMap)
             {
                 string key = kvp.Key;
@@ -8049,7 +8671,7 @@ namespace ScreenMonitoringApp
                 }
             }
             RearrangeCards();
-            pnlNotifsList.ResumeLayout(true);
+            pnlNotifsContent.ResumeLayout(true);
             UpdateCount();
         }
 
@@ -8064,25 +8686,28 @@ namespace ScreenMonitoringApp
             {
                 pnlHeader.Location = new Point(0, 0);
                 pnlHeader.Size = new Size(curW, headerH);
-                if (btnClearAll != null)
+                UpdateHeaderPositions();
+            }
+
+            int scrollBarW = 10;
+            if (vScrollBar != null)
+            {
+                vScrollBar.Location = new Point(curW - scrollBarW - 2, headerH + 6);
+                vScrollBar.Size = new Size(scrollBarW, Math.Max(50, curH - headerH - 12));
+            }
+
+            if (pnlNotifsViewport != null)
+            {
+                int vpW = curW - (vScrollBar != null && vScrollBar.Visible ? (scrollBarW + 4) : 0);
+                pnlNotifsViewport.Location = new Point(0, headerH + 2);
+                pnlNotifsViewport.Size = new Size(vpW, Math.Max(50, curH - headerH - 4));
+                if (lblEmptyHint != null)
                 {
-                    btnClearAll.Location = new Point(curW - 148, 7);
-                }
-                if (btnStartupToggle != null)
-                {
-                    btnStartupToggle.Location = new Point(curW - 340, 7);
+                    lblEmptyHint.Size = new Size(Math.Max(200, vpW - 40), 120);
                 }
             }
 
-            if (pnlNotifsList != null)
-            {
-                pnlNotifsList.Location = new Point(0, headerH + 2);
-                pnlNotifsList.Size = new Size(curW, Math.Max(50, curH - headerH - 4));
-                if (lblEmptyHint != null)
-                {
-                    lblEmptyHint.Size = new Size(Math.Max(200, curW - 40), 120);
-                }
-            }
+            RearrangeCards();
         }
 
         public void UpdateStartupState()
@@ -8095,8 +8720,8 @@ namespace ScreenMonitoringApp
             if (btnStartupToggle == null) return;
             bool enabled = WindowsStartupManager.IsStartupEnabled();
             btnStartupToggle.Text = enabled
-                ? L10n.T("🪟 Windows Başlangıcı: Açık", "🪟 Windows Startup: On")
-                : L10n.T("🪟 Windows Başlangıcı: Kapalı", "🪟 Windows Startup: Off");
+                ? L10n.T("🪟 Başlangıç: Açık", "🪟 Startup: On")
+                : L10n.T("🪟 Başlangıç: Kapalı", "🪟 Startup: Off");
             btnStartupToggle.ForeColor = enabled
                 ? MainForm.ColorSuccess
                 : MainForm.ColorTextMuted;
@@ -8113,10 +8738,29 @@ namespace ScreenMonitoringApp
             }
         }
 
+        public void LoadMockNotifications()
+        {
+            string[] senders = new string[] { "WhatsApp", "Instagram", "Gmail", "Telegram", "Ziraat Mobil", "YouTube", "Twitter / X", "Slack", "Messages" };
+            for (int mi = 0; mi < senders.Length; mi++)
+            {
+                AddNotification(new NotificationCardItem
+                {
+                    Id = 3000 + mi,
+                    Key = "mock_key_" + mi,
+                    PackageName = "com.mock." + senders[mi].ToLower().Replace(" ", ""),
+                    AppName = senders[mi],
+                    DeviceName = "Samsung SM_M315F",
+                    Title = senders[mi] + " - Yeni Bildirim #" + (mi + 1),
+                    Text = "Örnek bildirim içeriği ve detaylı mesaj metni burada gösterilir. (" + (mi + 1) + ")",
+                    Timestamp = DateTime.Now.Ticks
+                });
+            }
+        }
+
         public void AddNotification(NotificationCardItem item)
         {
-            if (pnlNotifsList == null) return;
-            lblEmptyHint.Visible = false;
+            if (pnlNotifsContent == null || pnlNotifsViewport == null) return;
+            if (lblEmptyHint != null) lblEmptyHint.Visible = false;
 
             if (cardMap.ContainsKey(item.Key))
             {
@@ -8125,12 +8769,13 @@ namespace ScreenMonitoringApp
 
             notifItems[item.Key] = item;
 
-            int cardW = pnlNotifsList.ClientSize.Width - 24;
-            Panel card = new Panel
+            int viewportW = pnlNotifsViewport.ClientSize.Width;
+            int scrollOffset = (vScrollBar != null && vScrollBar.Visible) ? 22 : 0;
+            int cardW = Math.Max(200, viewportW - 24 - scrollOffset);
+
+            NotificationCardControl card = new NotificationCardControl
             {
                 Size = new Size(cardW, 72),
-                BackColor = MainForm.ColorCard,
-                Padding = new Padding(12, 8, 12, 8),
                 Tag = item
             };
 
@@ -8138,8 +8783,9 @@ namespace ScreenMonitoringApp
             PictureBox pbIcon = new PictureBox
             {
                 Size = new Size(36, 36),
-                Location = new Point(12, 18),
-                SizeMode = PictureBoxSizeMode.Zoom
+                Location = new Point(14, 18),
+                SizeMode = PictureBoxSizeMode.Zoom,
+                BackColor = Color.Transparent
             };
             if (item.CachedIcon != null)
             {
@@ -8160,16 +8806,18 @@ namespace ScreenMonitoringApp
             }
             card.Controls.Add(pbIcon);
 
-            // Bilgi
-            int textW = cardW - 60 - 80;
+            // Bilgi ve metinler
+            int textW = Math.Max(80, cardW - 58 - 74 - 16);
             string devTag = !string.IsNullOrEmpty(item.DeviceName) ? ("  •  [" + item.DeviceName + "]") : "";
+
             Label lblApp = new Label
             {
                 Text = item.AppName + devTag + "  •  " + DateTime.Now.ToString("HH:mm"),
                 Font = new Font("Segoe UI", 8.0f, FontStyle.Bold),
                 ForeColor = MainForm.ColorAccent,
-                Location = new Point(56, 8),
-                AutoSize = true
+                Location = new Point(58, 8),
+                AutoSize = true,
+                BackColor = Color.Transparent
             };
             card.Controls.Add(lblApp);
 
@@ -8178,8 +8826,11 @@ namespace ScreenMonitoringApp
                 Text = item.Title,
                 Font = new Font("Segoe UI", 9.0f, FontStyle.Bold),
                 ForeColor = Color.White,
-                Location = new Point(56, 26),
-                Size = new Size(textW, 18)
+                Location = new Point(58, 26),
+                Size = new Size(textW, 18),
+                AutoEllipsis = true,
+                Tag = "LBL_TITLE",
+                BackColor = Color.Transparent
             };
             card.Controls.Add(lblTitle);
 
@@ -8188,21 +8839,43 @@ namespace ScreenMonitoringApp
                 Text = item.Text,
                 Font = new Font("Segoe UI", 8.5f, FontStyle.Regular),
                 ForeColor = MainForm.ColorTextMuted,
-                Location = new Point(56, 46),
-                Size = new Size(textW, 18)
+                Location = new Point(58, 46),
+                Size = new Size(textW, 18),
+                AutoEllipsis = true,
+                Tag = "LBL_BODY",
+                BackColor = Color.Transparent
             };
             card.Controls.Add(lblBody);
 
             // Kapat (Dismiss) Butonu
-            ModernButton btnDismiss = new ModernButton(L10n.T("✕ Kapat", "✕ Dismiss"), cardW - 74, 20, 64, 28, Color.FromArgb(28, 38, 58), MainForm.ColorTextMuted, 5);
+            ModernButton btnDismiss = new ModernButton(L10n.T("✕ Kapat", "✕ Dismiss"), cardW - 74, 22, 64, 28, Color.FromArgb(28, 38, 58), MainForm.ColorTextMuted, 5);
             btnDismiss.Font = new Font("Segoe UI", 8.0f, FontStyle.Bold);
             btnDismiss.Tag = "BTN_DISMISS";
             btnDismiss.Click += delegate
             {
-                flowManager.DismissNotification(item.PackageName, item.Id, item.Key, item.DeviceSerial);
+                if (flowManager != null)
+                {
+                    try { flowManager.DismissNotification(item.PackageName, item.Id, item.Key, item.DeviceSerial); } catch { }
+                }
                 RemoveNotification(item.Key);
             };
             card.Controls.Add(btnDismiss);
+
+            // Çocuklar üzerinde fare dolaşırken kartın ışıldaması
+            foreach (Control child in card.Controls)
+            {
+                if (child != btnDismiss)
+                {
+                    child.MouseEnter += delegate { card.SetHover(true); };
+                    child.MouseLeave += delegate
+                    {
+                        Point p = card.PointToClient(Cursor.Position);
+                        if (!card.ClientRectangle.Contains(p)) card.SetHover(false);
+                    };
+                }
+            }
+
+            AttachWheel(card);
 
             cardMap[item.Key] = card;
 
@@ -8210,20 +8883,20 @@ namespace ScreenMonitoringApp
                              string.Equals(item.DeviceSerial, currentFilterSerial, StringComparison.OrdinalIgnoreCase);
             card.Visible = isVisible;
 
-            pnlNotifsList.Controls.Add(card);
+            pnlNotifsContent.Controls.Add(card);
             RearrangeCards();
             UpdateCount();
         }
 
         public void RemoveNotification(string key)
         {
-            if (pnlNotifsList == null) return;
+            if (pnlNotifsContent == null) return;
             Control c;
             if (cardMap.TryGetValue(key, out c))
             {
                 cardMap.Remove(key);
                 notifItems.Remove(key);
-                pnlNotifsList.Controls.Remove(c);
+                pnlNotifsContent.Controls.Remove(c);
                 c.Dispose();
                 RearrangeCards();
                 UpdateCount();
@@ -8232,22 +8905,85 @@ namespace ScreenMonitoringApp
 
         private void RearrangeCards()
         {
-            int curY = 10;
+            if (pnlNotifsViewport == null || pnlNotifsContent == null) return;
+
+            int viewportH = pnlNotifsViewport.ClientSize.Height;
+            if (viewportH <= 0) return;
+
             int visibleCount = 0;
-            foreach (Control c in pnlNotifsList.Controls)
+            int estimatedTotalH = 10;
+            foreach (Control c in pnlNotifsContent.Controls)
             {
                 if (c == lblEmptyHint || !c.Visible) continue;
-                c.Location = new Point(12, curY);
-                curY += c.Height + 8;
+                estimatedTotalH += c.Height + 8;
                 visibleCount++;
             }
-            if (visibleCount == 0)
+
+            bool needsScroll = (estimatedTotalH > viewportH);
+            if (vScrollBar != null)
             {
-                lblEmptyHint.Visible = true;
+                vScrollBar.Visible = (visibleCount > 0 && needsScroll);
+            }
+
+            int scrollBarW = 10;
+            int vpW = this.ClientSize.Width - (vScrollBar != null && vScrollBar.Visible ? (scrollBarW + 4) : 0);
+            pnlNotifsViewport.Size = new Size(vpW, Math.Max(50, this.ClientSize.Height - 44 - 4));
+            pnlNotifsContent.Width = vpW;
+
+            int targetCardW = Math.Max(200, vpW - 24);
+
+            int curY = 10;
+            foreach (Control c in pnlNotifsContent.Controls)
+            {
+                if (c == lblEmptyHint || !c.Visible) continue;
+
+                c.Location = new Point(12, curY);
+                c.Width = targetCardW;
+
+                // Kartın içindeki kontrolleri dinamik yeniden konumlandır
+                foreach (Control child in c.Controls)
+                {
+                    if (child is ModernButton && string.Equals(child.Tag as string, "BTN_DISMISS"))
+                    {
+                        child.Location = new Point(targetCardW - child.Width - 12, (c.Height - child.Height) / 2);
+                    }
+                    else if (child is Label)
+                    {
+                        string tag = child.Tag as string;
+                        if (tag == "LBL_TITLE" || tag == "LBL_BODY")
+                        {
+                            int textW = Math.Max(80, targetCardW - 58 - 74 - 16);
+                            child.Width = textW;
+                        }
+                    }
+                }
+
+                curY += c.Height + 8;
+            }
+
+            int totalContentH = Math.Max(viewportH, curY + 12);
+            pnlNotifsContent.Height = totalContentH;
+
+            if (vScrollBar != null && vScrollBar.Visible)
+            {
+                vScrollBar.Minimum = 0;
+                vScrollBar.Maximum = totalContentH;
+                vScrollBar.LargeChange = viewportH;
+                int maxVal = Math.Max(0, totalContentH - viewportH);
+                if (vScrollBar.Value > maxVal) vScrollBar.Value = maxVal;
+                pnlNotifsContent.Top = -vScrollBar.Value;
             }
             else
             {
-                lblEmptyHint.Visible = false;
+                if (vScrollBar != null) vScrollBar.Value = 0;
+                pnlNotifsContent.Top = 0;
+            }
+
+            if (lblEmptyHint != null)
+            {
+                lblEmptyHint.Visible = (visibleCount == 0);
+                lblEmptyHint.Location = new Point(20, 60);
+                lblEmptyHint.Size = new Size(Math.Max(200, vpW - 40), 120);
             }
         }
 
@@ -8260,8 +8996,457 @@ namespace ScreenMonitoringApp
                 {
                     if (c.Visible) count++;
                 }
-                lblCount.Text = string.Format("({0} {1})", count, L10n.T("Bildirim", "Notifications"));
+                lblCount.Text = string.Format("({0})", count);
                 UpdateHeaderPositions();
+            }
+        }
+    }
+
+    public static class MobiTestSuite
+    {
+        private static int totalTests = 0;
+        private static int passedTests = 0;
+        private static int failedTests = 0;
+        private static readonly StringBuilder report = new StringBuilder();
+
+        private static void Assert(bool condition, string testName, string details = "")
+        {
+            totalTests++;
+            if (condition)
+            {
+                passedTests++;
+                string line = string.Format("[PASS] {0}{1}", testName, string.IsNullOrEmpty(details) ? "" : " (" + details + ")");
+                report.AppendLine(line);
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine(line);
+                Console.ResetColor();
+            }
+            else
+            {
+                failedTests++;
+                string line = string.Format("[FAIL] {0}{1}", testName, string.IsNullOrEmpty(details) ? "" : " (" + details + ")");
+                report.AppendLine(line);
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine(line);
+                Console.ResetColor();
+            }
+        }
+
+        public static int RunAll()
+        {
+            report.AppendLine("═══════════════════════════════════════════════════════════");
+            report.AppendLine("   MOBIDESK COMPREHENSIVE AUTOMATED TEST SUITE   ");
+            report.AppendLine("═══════════════════════════════════════════════════════════");
+            Console.WriteLine(report.ToString());
+
+            try { TestModernDarkScrollBar(); } catch (Exception ex) { Assert(false, "TestModernDarkScrollBar Exception", ex.ToString()); }
+            try { TestFormMinimumSize(); } catch (Exception ex) { Assert(false, "TestFormMinimumSize Exception", ex.ToString()); }
+            try { TestHeaderAntiCollision(); } catch (Exception ex) { Assert(false, "TestHeaderAntiCollision Exception", ex.ToString()); }
+            try { TestNotificationsResponsiveCards(); } catch (Exception ex) { Assert(false, "TestNotificationsResponsiveCards Exception", ex.ToString()); }
+            try { TestScrollBarVisibilityAndScrolling(); } catch (Exception ex) { Assert(false, "TestScrollBarVisibilityAndScrolling Exception", ex.ToString()); }
+            try { TestNotificationDismissAndClearAll(); } catch (Exception ex) { Assert(false, "TestNotificationDismissAndClearAll Exception", ex.ToString()); }
+            try { TestDeviceFiltering(); } catch (Exception ex) { Assert(false, "TestDeviceFiltering Exception", ex.ToString()); }
+            try { TestFlowPanelScrollBar(); } catch (Exception ex) { Assert(false, "TestFlowPanelScrollBar Exception", ex.ToString()); }
+
+            report.AppendLine("═══════════════════════════════════════════════════════════");
+            string summary = string.Format("RESULTS: Total={0}, Passed={1}, Failed={2}", totalTests, passedTests, failedTests);
+            report.AppendLine(summary);
+            report.AppendLine("═══════════════════════════════════════════════════════════");
+            Console.WriteLine(summary);
+
+            try
+            {
+                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "test_results.log");
+                File.WriteAllText(logPath, report.ToString());
+            }
+            catch { }
+
+            return failedTests == 0 ? 0 : 1;
+        }
+
+        private static void TestModernDarkScrollBar()
+        {
+            using (ModernDarkScrollBar sb = new ModernDarkScrollBar())
+            {
+                sb.Size = new Size(10, 400);
+
+                Assert(sb.Minimum == 0 && sb.Maximum == 100 && sb.Value == 0,
+                    "ScrollBar: Initial default bounds and value",
+                    string.Format("Min={0}, Max={1}, Val={2}", sb.Minimum, sb.Maximum, sb.Value));
+
+                Assert(sb.Width == 10, "ScrollBar: Slim 10px width");
+
+                // Clamp below minimum
+                sb.Value = -50;
+                Assert(sb.Value == 0, "ScrollBar: Negative value clamped to minimum (0)");
+
+                // Clamp above maximum - largeChange
+                sb.Maximum = 500;
+                sb.LargeChange = 100;
+                sb.Value = 1000;
+                Assert(sb.Value == 400, "ScrollBar: Clamped to (Maximum - LargeChange)",
+                    string.Format("Val={0}, Expected=400", sb.Value));
+
+                // ValueChanged event firing
+                bool changedFired = false;
+                sb.ValueChanged += delegate { changedFired = true; };
+                sb.Value = 250;
+                Assert(changedFired && sb.Value == 250, "ScrollBar: ValueChanged fired on valid change");
+
+                changedFired = false;
+                sb.Value = 250;
+                Assert(!changedFired, "ScrollBar: ValueChanged NOT fired when value is unchanged");
+
+                // Maximum update auto-clamp
+                sb.Value = 200;
+                sb.Maximum = 250; // maxPossible = 250 - 100 = 150
+                Assert(sb.Value == 150, "ScrollBar: Maximum reduction auto-clamps Value",
+                    string.Format("Val={0}, Expected=150", sb.Value));
+
+                // LargeChange update auto-clamp
+                sb.Value = 100;
+                sb.LargeChange = 200; // maxPossible = 250 - 200 = 50
+                Assert(sb.Value == 50, "ScrollBar: LargeChange increase auto-clamps Value",
+                    string.Format("Val={0}, Expected=50", sb.Value));
+
+                // Thumb rectangle geometry
+                Rectangle tr = sb.GetThumbRectForTest();
+                Assert(tr.Height >= 32, "ScrollBar: Thumb minimum pill height >= 32px",
+                    string.Format("Height={0}", tr.Height));
+                Assert(tr.Bottom <= sb.Height, "ScrollBar: Thumb rect stays inside control bounds",
+                    string.Format("Bottom={0}, SbHeight={1}", tr.Bottom, sb.Height));
+            }
+        }
+
+        private static void TestFormMinimumSize()
+        {
+            using (MainForm f = new MainForm(false, null, false, 0, false))
+            {
+                f.reallyExit = true;
+                Assert(f.MinimumSize.Width >= 860, "Form: MinimumSize Width >= 860",
+                    string.Format("Width={0}", f.MinimumSize.Width));
+                Assert(f.MinimumSize.Height >= 680, "Form: MinimumSize Height >= 680",
+                    string.Format("Height={0}", f.MinimumSize.Height));
+
+                f.ClientSize = new Size(860, 680);
+
+                Assert(f.cardOpts != null && f.pnlRightCol != null, "Layout: cardOpts and pnlRightCol exist");
+                if (f.cardOpts != null && f.pnlRightCol != null)
+                {
+                    Assert(f.cardOpts.Bottom <= f.pnlRightCol.Height,
+                        "Layout [860x680]: cardOpts fits inside right column",
+                        string.Format("cardOpts.B={0}, pnlRightCol.H={1}", f.cardOpts.Bottom, f.pnlRightCol.Height));
+                }
+
+                if (f.swStartup != null && f.cardOpts != null)
+                {
+                    Assert(f.swStartup.Bottom <= f.cardOpts.Height,
+                        "Layout [860x680]: swStartup fits inside cardOpts without clipping",
+                        string.Format("swStartup.B={0}, cardOpts.H={1}", f.swStartup.Bottom, f.cardOpts.Height));
+                }
+
+                if (f.btnStartStop != null && f.pnlBottomBar != null)
+                {
+                    Assert(f.btnStartStop.Bottom <= f.pnlBottomBar.Top,
+                        "Layout [860x680]: btnStartStop does not overlap bottom bar",
+                        string.Format("btnStartStop.B={0}, pnlBottomBar.T={1}", f.btnStartStop.Bottom, f.pnlBottomBar.Top));
+                    Assert(f.pnlBottomBar.Bottom <= f.ClientSize.Height,
+                        "Layout [860x680]: pnlBottomBar fits inside client height",
+                        string.Format("pnlBottomBar.B={0}, ClientH={1}", f.pnlBottomBar.Bottom, f.ClientSize.Height));
+                }
+
+                f.Close();
+            }
+
+            Assert(AppConfig.WindowWidth >= 860, "AppConfig: Minimum WindowWidth enforced >= 860",
+                string.Format("WindowWidth={0}", AppConfig.WindowWidth));
+            Assert(AppConfig.WindowHeight >= 680, "AppConfig: Minimum WindowHeight enforced >= 680",
+                string.Format("WindowHeight={0}", AppConfig.WindowHeight));
+        }
+
+        private static void TestHeaderAntiCollision()
+        {
+            bool origLang = L10n.IsEnglish;
+            try
+            {
+                // Test in English
+                L10n.IsEnglish = true;
+                using (MobiNotificationsPanel pnl = new MobiNotificationsPanel(0, 0, 836, 500, null))
+                {
+                    pnl.ApplyLanguage();
+                    VerifyHeaderBounds(pnl, "English");
+                }
+
+                // Test in Turkish
+                L10n.IsEnglish = false;
+                using (MobiNotificationsPanel pnl = new MobiNotificationsPanel(0, 0, 836, 500, null))
+                {
+                    pnl.ApplyLanguage();
+                    VerifyHeaderBounds(pnl, "Turkish");
+                }
+            }
+            finally
+            {
+                L10n.IsEnglish = origLang;
+            }
+        }
+
+        private static void VerifyHeaderBounds(MobiNotificationsPanel pnl, string langLabel)
+        {
+            Assert(pnl.pnlHeader != null, "Header [" + langLabel + "]: Header panel exists");
+            if (pnl.pnlHeader == null) return;
+
+            Assert(pnl.lblTitle.Right < pnl.lblCount.Left,
+                "Header [" + langLabel + "]: Title does not collide with Count",
+                string.Format("Title.R={0}, Count.L={1}", pnl.lblTitle.Right, pnl.lblCount.Left));
+
+            Assert(pnl.lblCount.Right < pnl.lblStatusDot.Left,
+                "Header [" + langLabel + "]: Count does not collide with StatusDot",
+                string.Format("Count.R={0}, Dot.L={1}", pnl.lblCount.Right, pnl.lblStatusDot.Left));
+
+            Assert(pnl.lblStatusDot.Right < pnl.lblStatusText.Left,
+                "Header [" + langLabel + "]: StatusDot does not collide with StatusText",
+                string.Format("Dot.R={0}, Status.L={1}", pnl.lblStatusDot.Right, pnl.lblStatusText.Left));
+
+            if (pnl.cbDeviceFilter.Visible)
+            {
+                Assert(pnl.lblStatusText.Right < pnl.cbDeviceFilter.Left,
+                    "Header [" + langLabel + "]: StatusText does not collide with Filter",
+                    string.Format("Status.R={0}, Filter.L={1}", pnl.lblStatusText.Right, pnl.cbDeviceFilter.Left));
+
+                Assert(pnl.cbDeviceFilter.Right < pnl.btnStartupToggle.Left,
+                    "Header [" + langLabel + "]: Filter does not collide with Startup button",
+                    string.Format("Filter.R={0}, Startup.L={1}", pnl.cbDeviceFilter.Right, pnl.btnStartupToggle.Left));
+            }
+
+            Assert(pnl.btnStartupToggle.Right < pnl.btnClearAll.Left,
+                "Header [" + langLabel + "]: Startup button does not collide with Clear All button",
+                string.Format("Startup.R={0}, Clear.L={1}", pnl.btnStartupToggle.Right, pnl.btnClearAll.Left));
+
+            Assert(pnl.btnClearAll.Right <= pnl.pnlHeader.Width,
+                "Header [" + langLabel + "]: Clear All button does not overflow header width",
+                string.Format("Clear.R={0}, Header.W={1}", pnl.btnClearAll.Right, pnl.pnlHeader.Width));
+        }
+
+        private static void TestNotificationsResponsiveCards()
+        {
+            int[] testWidths = new int[] { 836, 1024, 1400 };
+            foreach (int tw in testWidths)
+            {
+                using (MobiNotificationsPanel pnl = new MobiNotificationsPanel(0, 0, tw, 500, null))
+                {
+                    pnl.AddNotification(new NotificationCardItem
+                    {
+                        Id = 101,
+                        Key = "resp_test_" + tw,
+                        PackageName = "com.mobidesk.test",
+                        AppName = "TestApp",
+                        Title = "Notification with fairly long title text to check truncation and bounds",
+                        Text = "Body line with sufficient content to verify responsive card layout",
+                        DeviceSerial = "DEV_RESP",
+                        Timestamp = DateTime.UtcNow.Ticks
+                    });
+
+                    Control card;
+                    Assert(pnl.cardMap.TryGetValue("resp_test_" + tw, out card),
+                        "Responsive [" + tw + "px]: Card added to map");
+
+                    if (card != null)
+                    {
+                        int vpW = pnl.pnlNotifsViewport.ClientSize.Width;
+                        int expectedCardW = Math.Max(200, vpW - 24);
+
+                        Assert(card.Width == expectedCardW,
+                            "Responsive [" + tw + "px]: Card width adapts dynamically",
+                            string.Format("Actual={0}, Expected={1}", card.Width, expectedCardW));
+
+                        Assert(card.Left == 12, "Responsive [" + tw + "px]: Card left margin is 12px");
+
+                        ModernButton dismissBtn = null;
+                        Label titleLbl = null;
+                        foreach (Control c in card.Controls)
+                        {
+                            if (c is ModernButton && string.Equals(c.Tag as string, "BTN_DISMISS")) dismissBtn = (ModernButton)c;
+                            if (c is Label && string.Equals(c.Tag as string, "LBL_TITLE")) titleLbl = (Label)c;
+                        }
+
+                        Assert(dismissBtn != null, "Responsive [" + tw + "px]: Dismiss button exists");
+                        if (dismissBtn != null)
+                        {
+                            Assert(dismissBtn.Right <= card.Width,
+                                "Responsive [" + tw + "px]: Dismiss button stays within card",
+                                string.Format("Dismiss.R={0}, Card.W={1}", dismissBtn.Right, card.Width));
+
+                            int expectedDismissX = card.Width - dismissBtn.Width - 12;
+                            Assert(dismissBtn.Left == expectedDismissX,
+                                "Responsive [" + tw + "px]: Dismiss button pinned to right edge with 12px padding",
+                                string.Format("Dismiss.L={0}, Expected={1}", dismissBtn.Left, expectedDismissX));
+                        }
+
+                        if (titleLbl != null && dismissBtn != null)
+                        {
+                            Assert(titleLbl.Right < dismissBtn.Left,
+                                "Responsive [" + tw + "px]: Title label does not collide with Dismiss button",
+                                string.Format("Title.R={0}, Dismiss.L={1}", titleLbl.Right, dismissBtn.Left));
+                        }
+                    }
+
+                    Assert(!pnl.pnlNotifsViewport.AutoScroll,
+                        "Responsive [" + tw + "px]: Native AutoScroll is FALSE (no ugly horizontal scrollbar)");
+                }
+            }
+        }
+
+        private static void TestScrollBarVisibilityAndScrolling()
+        {
+            using (MobiNotificationsPanel pnl = new MobiNotificationsPanel(0, 0, 836, 400, null))
+            {
+                // 1. Zero notifications
+                Assert(!pnl.vScrollBar.Visible, "ScrollTest: ScrollBar hidden when 0 notifications");
+                Assert(pnl.lblEmptyHint.Visible, "ScrollTest: Empty hint visible when 0 notifications");
+
+                // 2. Add 1 notification (height 72 + 8 = 80px <= viewport 354px)
+                pnl.AddNotification(new NotificationCardItem { Key = "s1", Title = "Title 1", Text = "Msg 1" });
+                Assert(!pnl.vScrollBar.Visible, "ScrollTest: ScrollBar hidden when notifications fit in viewport");
+                Assert(!pnl.lblEmptyHint.Visible, "ScrollTest: Empty hint hidden when >= 1 notification exists");
+
+                // 3. Add 9 more (total 10 cards -> 800px > 354px)
+                for (int i = 2; i <= 10; i++)
+                {
+                    pnl.AddNotification(new NotificationCardItem { Key = "s" + i, Title = "Title " + i, Text = "Msg " + i });
+                }
+
+                Assert(pnl.vScrollBar.Visible, "ScrollTest: ScrollBar visible when cards exceed viewport");
+                Assert(pnl.vScrollBar.Maximum > pnl.pnlNotifsViewport.Height,
+                    "ScrollTest: ScrollBar Maximum exceeds viewport height",
+                    string.Format("Max={0}, VpH={1}", pnl.vScrollBar.Maximum, pnl.pnlNotifsViewport.Height));
+
+                // 4. Test scrolling
+                pnl.vScrollBar.Value = 100;
+                Assert(pnl.pnlNotifsContent.Top == -100,
+                    "ScrollTest: Content panel scrolled up by scrollbar value",
+                    string.Format("Content.Top={0}", pnl.pnlNotifsContent.Top));
+
+                pnl.vScrollBar.Value = 0;
+                Assert(pnl.pnlNotifsContent.Top == 0,
+                    "ScrollTest: Content panel reset to top when scrollbar is 0");
+            }
+        }
+
+        private static void TestNotificationDismissAndClearAll()
+        {
+            using (MobiNotificationsPanel pnl = new MobiNotificationsPanel(0, 0, 836, 400, null))
+            {
+                pnl.AddNotification(new NotificationCardItem { Key = "card_a", Title = "Card A", Text = "Msg A" });
+                pnl.AddNotification(new NotificationCardItem { Key = "card_b", Title = "Card B", Text = "Msg B" });
+                pnl.AddNotification(new NotificationCardItem { Key = "card_c", Title = "Card C", Text = "Msg C" });
+
+                Assert(pnl.cardMap.Count == 3, "DismissTest: 3 cards added");
+                Assert(pnl.lblCount.Text == "(3)", "DismissTest: Count shows (3)");
+
+                // Dismiss 1 card
+                pnl.RemoveNotification("card_b");
+                Assert(pnl.cardMap.Count == 2, "DismissTest: 2 cards left after dismissing card_b");
+                Assert(pnl.lblCount.Text == "(2)", "DismissTest: Count updated to (2)");
+                Assert(!pnl.cardMap.ContainsKey("card_b"), "DismissTest: card_b removed from cardMap");
+
+                // Clear All via btnClearAll.PerformClick()
+                pnl.btnClearAll.PerformClick();
+                Assert(pnl.cardMap.Count == 0, "DismissTest: 0 cards after Clear All");
+                Assert(pnl.lblCount.Text == "(0)", "DismissTest: Count reset to (0)");
+                Assert(pnl.lblEmptyHint.Visible, "DismissTest: Empty hint restored and visible after Clear All");
+                Assert(!pnl.vScrollBar.Visible, "DismissTest: ScrollBar hidden after Clear All");
+            }
+        }
+
+        private static void TestDeviceFiltering()
+        {
+            using (MobiNotificationsPanel pnl = new MobiNotificationsPanel(0, 0, 836, 400, null))
+            {
+                pnl.AddNotification(new NotificationCardItem { Key = "dev1_n1", DeviceSerial = "PHONE_1", Title = "P1-N1", Text = "M" });
+                pnl.AddNotification(new NotificationCardItem { Key = "dev1_n2", DeviceSerial = "PHONE_1", Title = "P1-N2", Text = "M" });
+                pnl.AddNotification(new NotificationCardItem { Key = "dev2_n1", DeviceSerial = "TABLET_2", Title = "T2-N1", Text = "M" });
+
+                List<ConnectedDeviceItem> devs = new List<ConnectedDeviceItem>
+                {
+                    new ConnectedDeviceItem { Serial = "PHONE_1", Model = "Pixel 7" },
+                    new ConnectedDeviceItem { Serial = "TABLET_2", Model = "Galaxy Tab" }
+                };
+                pnl.UpdateDeviceList(devs);
+
+                Assert(pnl.cbDeviceFilter.Items.Count == 3, "FilterTest: 3 items in device filter (All + 2 devices)");
+
+                // Filter to PHONE_1 (index 1)
+                pnl.cbDeviceFilter.SelectedIndex = 1;
+                Assert(pnl.cardMap["dev1_n1"].Visible, "FilterTest: dev1_n1 is visible");
+                Assert(pnl.cardMap["dev1_n2"].Visible, "FilterTest: dev1_n2 is visible");
+                Assert(!pnl.cardMap["dev2_n1"].Visible, "FilterTest: dev2_n1 is hidden");
+                Assert(pnl.lblCount.Text == "(2)", "FilterTest: Count reflects filtered count (2)");
+
+                // Filter to TABLET_2 (index 2)
+                pnl.cbDeviceFilter.SelectedIndex = 2;
+                Assert(!pnl.cardMap["dev1_n1"].Visible, "FilterTest: dev1_n1 is hidden");
+                Assert(pnl.cardMap["dev2_n1"].Visible, "FilterTest: dev2_n1 is visible");
+                Assert(pnl.lblCount.Text == "(1)", "FilterTest: Count reflects filtered count (1)");
+
+                // Reset filter to All (index 0)
+                pnl.cbDeviceFilter.SelectedIndex = 0;
+                Assert(pnl.cardMap["dev1_n1"].Visible && pnl.cardMap["dev1_n2"].Visible && pnl.cardMap["dev2_n1"].Visible,
+                    "FilterTest: All notifications visible when filter reset");
+                Assert(pnl.lblCount.Text == "(3)", "FilterTest: Count reset to total (3)");
+            }
+        }
+
+        private static void TestFlowPanelScrollBar()
+        {
+            using (MobiFlowPanel flow = new MobiFlowPanel(0, 0, 836, 500, null))
+            {
+                // 1. Viewport & Scrollbar structure
+                Assert(flow.pnlFlowViewport != null && !flow.pnlFlowViewport.AutoScroll,
+                    "FlowScrollTest: Viewport exists and native AutoScroll is FALSE");
+                Assert(flow.vScrollBar != null && !flow.vScrollBar.Visible,
+                    "FlowScrollTest: ModernDarkScrollBar initially hidden when 0 messages");
+                Assert(flow.pnlMessages != null,
+                    "FlowScrollTest: pnlMessages content panel exists inside viewport");
+
+                // 2. Add 1 short message (fits in viewport ~400px)
+                flow.AddMessage(new FlowMessageItem { Id = "m1", Text = "Merhaba", Sender = "mobile" });
+                Assert(!flow.vScrollBar.Visible,
+                    "FlowScrollTest: ScrollBar stays hidden when 1 message fits viewport");
+
+                // 3. Add multiple messages until viewport is exceeded
+                for (int i = 2; i <= 15; i++)
+                {
+                    flow.AddMessage(new FlowMessageItem
+                    {
+                        Id = "m" + i,
+                        Text = "Test Flow Mesajı #" + i + " uzun metin içeriği ve detaylar",
+                        Sender = (i % 2 == 0) ? "pc" : "mobile"
+                    });
+                }
+
+                Assert(flow.vScrollBar.Visible,
+                    "FlowScrollTest: ScrollBar visible when messages exceed viewport height");
+                Assert(flow.vScrollBar.Maximum > flow.pnlFlowViewport.Height,
+                    "FlowScrollTest: ScrollBar Maximum exceeds viewport height",
+                    string.Format("Max={0}, VpH={1}", flow.vScrollBar.Maximum, flow.pnlFlowViewport.Height));
+
+                // 4. Test scrolling behavior
+                flow.vScrollBar.Value = 120;
+                Assert(flow.pnlMessages.Top == -120,
+                    "FlowScrollTest: pnlMessages scrolls up by scrollbar value (-120)",
+                    string.Format("pnlMessages.Top={0}", flow.pnlMessages.Top));
+
+                flow.vScrollBar.Value = 0;
+                Assert(flow.pnlMessages.Top == 0,
+                    "FlowScrollTest: pnlMessages resets to 0 when scrollbar is 0");
+
+                // 5. Test auto-scroll to bottom on new message
+                flow.AddMessage(new FlowMessageItem { Id = "m_last", Text = "Son mesaj", Sender = "pc" });
+                int expectedMax = Math.Max(0, flow.vScrollBar.Maximum - flow.vScrollBar.LargeChange);
+                Assert(flow.vScrollBar.Value == expectedMax,
+                    "FlowScrollTest: Auto-scrolls to bottom on new message",
+                    string.Format("Val={0}, Expected={1}", flow.vScrollBar.Value, expectedMax));
             }
         }
     }
