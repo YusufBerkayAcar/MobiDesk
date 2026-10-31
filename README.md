@@ -16,12 +16,12 @@ Turn your Android tablet or smartphone into a **true 60 FPS**, **ultra-low laten
   <table>
     <tr>
       <td width="48%" align="center" valign="middle">
-        <img src="mobidesk_studio.png" alt="MobiDesk PC Studio" width="100%" />
+        <img src="assets/screenshots/mobidesk_studio.png" alt="MobiDesk PC Studio" width="100%" />
         <br/>
         <strong>🖥️ Windows PC Studio (Control Center)</strong>
       </td>
       <td width="52%" align="center" valign="middle">
-        <img src="mobidesk_mobile.png" alt="MobiDesk Android Client" width="100%" />
+        <img src="assets/screenshots/mobidesk_mobile.png" alt="MobiDesk Android Client" width="100%" />
         <br/>
         <strong>📱 Android Client (Standby & MobiHub)</strong>
       </td>
@@ -107,15 +107,37 @@ MobiDesk is designed around simplicity, raw speed, and total privacy:
 ## 🛠️ Build & Installation
 
 ### PC App (Zero Dependencies)
-Compiles natively on Windows with the built-in .NET 4.0 C# compiler:
+Compiles natively on Windows with the built-in .NET 4.0 C# compiler using the standalone build script:
+```cmd
+desktop\build.bat
+```
+*(Optionally run tests after build: `desktop\build.bat --test`)*
+
+Or compile manually via Microsoft .NET `csc.exe`:
 ```powershell
-C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /unsafe /win32icon:app_icon.ico /win32manifest:app.manifest /out:MobiDesk.exe ScreenMonitorGUI.cs
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /nologo /target:winexe /unsafe /win32icon:assets\icons\app_icon.ico /win32manifest:desktop\app.manifest /out:desktop\MobiDesk.exe desktop\ScreenMonitorGUI.cs
 ```
 
+To launch MobiDesk from the repository root:
+* Double-click **`MobiDesk.lnk`** shortcut, or
+* Run **`.\MobiDesk.bat`** (or `.\MobiDesk.bat --test` for automated tests).
+
+### Virtual Display & Audio Drivers Setup
+Automated lifecycle scripts are located under the `drivers/` directory:
+* **Virtual Display Driver (Secondary Screen Extension)**:
+  * Install: Run `drivers\display\Sanal_Ekran_Ekle.bat` (Run as Administrator)
+  * Remove: Run `drivers\display\Sanal_Ekran_Kaldir.bat` (Run as Administrator)
+* **Virtual Audio Driver (Real-time Audio Streaming)**:
+  * Install: Run `drivers\audio\Sanal_Ses_Ekle.bat` (Run as Administrator)
+  * Remove: Run `drivers\audio\Sanal_Ses_Kaldir.bat` (Run as Administrator)
+*(Note: Virtual display and audio drivers can also be installed and toggled directly within the MobiDesk PC Studio UI).*
+
 ### Android Client (Gradle)
+Build the Android debug APK from the repository root (delegates directly to `android/`):
 ```bash
 .\gradlew.bat assembleDebug
 ```
+Or navigate into `android/` and run `./gradlew assembleDebug`. The generated APK will be at `android\app\build\outputs\apk\debug\app-debug.apk`.
 
 ---
 

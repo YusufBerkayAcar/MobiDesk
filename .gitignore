@@ -1,7 +1,10 @@
 # Gradle & Build Cache
 .gradle/
+android/.gradle/
 build/
+android/build/
 app/build/
+android/app/build/
 .cxx/
 .externalNativeBuild/
 captures/
@@ -11,6 +14,7 @@ captures/
 *.iml
 .kotlin/
 local.properties
+android/local.properties
 
 # Logs & Dumps
 *.log
@@ -26,6 +30,7 @@ Thumbs.db
 *.swp
 *.cfg
 mobidesk.cfg
+*.lnk
 
 # Visual Studio / C# build artifacts (if opened in VS)
 bin/
@@ -34,3 +39,10 @@ obj/
 *.suo
 *.userosscache
 *.sln.docstates
+*.pdb
+MobiDesk_new.exe
+*_temp.exe
+
+# AI Agent Workspaces & Handoffs
+.agents/
+TEST_READY.md

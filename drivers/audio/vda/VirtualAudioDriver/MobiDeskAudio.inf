@@ -1,0 +1,122 @@
+;
+; MobiDeskAudio.inf
+; MobiDesk Virtual Audio Device Driver
+;
+
+[Version]
+Signature="$CHICAGO$"
+Class=MEDIA
+Provider=%ProviderName%
+ClassGUID={4d36e96c-e325-11ce-bfc1-08002be10318}
+DriverVer = 10/30/2026,1.0.0.0
+CatalogFile=MobiDeskAudio.cat
+PnpLockDown=1
+
+[Manufacturer]
+%MfgName%=MobiDesk,NTamd64
+
+[MobiDesk.NTamd64]
+%MobiDesk_Device.DeviceDesc%=MobiDesk_Device,Root\MobiDeskAudio
+
+;-----------------------------------------------------------------------------
+; Device Installation
+;-----------------------------------------------------------------------------
+[MobiDesk_Device.NT]
+Include=ks.inf,wdmaudio.inf
+Needs=KS.Registration, WDMAUDIO.Registration
+CopyFiles=MobiDesk_Device.CopyList
+AddReg=MobiDesk_Device.AddReg
+
+[MobiDesk_Device.NT.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_Wave%,MobiDesk_Device.I.Wave
+AddInterface=%KSCATEGORY_RENDER%,%KSNAME_Wave%,MobiDesk_Device.I.Wave
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_Topology%,MobiDesk_Device.I.Topo
+
+[MobiDesk_Device.NT.Services]
+AddService=MobiDeskAudio,0x00000002,MobiDesk_Device_Service_Inst
+
+[MobiDesk_Device_Service_Inst]
+DisplayName=%MobiDesk_Device.SvcDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%10%\system32\drivers\MobiDeskAudio.sys
+
+;-----------------------------------------------------------------------------
+; Registry Data
+;-----------------------------------------------------------------------------
+[MobiDesk_Device.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,MobiDeskAudio.sys
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+
+HKR,Drivers\wave\wdmaud.drv,Description,,%MobiDesk_Device.DeviceDesc%
+HKR,Drivers\midi\wdmaud.drv,Description,,%MobiDesk_Device_MIDI%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%MobiDesk_Device.DeviceDesc%
+
+HKLM,%MediaCategories%\%GUID.DSPEAKERS%,Name,,%Name.DSPEAKERS%
+
+[MobiDesk_Device.I.Wave]
+AddReg=MobiDesk_Device.I.Wave.AddReg
+
+[MobiDesk_Device.I.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%MobiDesk_Device.Wave.szPname%
+
+[MobiDesk_Device.I.Topo]
+AddReg=MobiDesk_Device.I.Topo.AddReg, OEMSettingsOverride.AddReg
+
+[MobiDesk_Device.I.Topo.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%MobiDesk_Device.Topo.szPname%
+
+[OEMSettingsOverride.AddReg]
+HKR,"EP\\0", %PKEY_AudioEndpoint_Association%,,%KSNODETYPE_SPEAKER%
+
+;-----------------------------------------------------------------------------
+; File Layout
+;-----------------------------------------------------------------------------
+[SourceDisksNames]
+222="MobiDesk Audio Driver Disc","",222
+
+[SourceDisksFiles]
+MobiDeskAudio.sys=222
+
+[SourceDisksFiles.amd64]
+MobiDeskAudio.sys=222
+
+[DestinationDirs]
+MobiDesk_Device.CopyList=10,system32\drivers
+
+[MobiDesk_Device.CopyList]
+MobiDeskAudio.sys
+
+;-----------------------------------------------------------------------------
+; Strings
+;-----------------------------------------------------------------------------
+[Strings]
+ProviderName="MobiDesk"
+MfgName="MobiDesk"
+MobiDesk_Device.DeviceDesc="MobiDesk Audio"
+MobiDesk_Device.SvcDesc="MobiDesk Audio Service"
+MobiDesk_Device.Wave.szPname="MobiDesk Audio"
+MobiDesk_Device.Topo.szPname="MobiDesk Audio Topology"
+MobiDesk_Device_MIDI="MobiDesk Audio MIDI"
+
+Proxy.CLSID="{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO="{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER="{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+
+KSNAME_Wave="MobiDesk Wave"
+KSNAME_Topology="MobiDesk Topology"
+
+GUID.DSPEAKERS="{6518B5E9-772E-48E2-B110-1752F65934E8}"
+Name.DSPEAKERS="MobiDesk Audio"
+MediaCategories="SYSTEM\CurrentControlSet\Control\MediaCategories"
+
+KSNODETYPE_SPEAKER = "{DFF21CE1-F70F-11D0-B917-00A0C9223196}"
+PKEY_AudioEndpoint_Association = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},2"
