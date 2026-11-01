@@ -33,8 +33,10 @@ if (-not $SkipCSharp) {
         $overallSuccess = $false
         $buildResults["CSharp"] = "FAILED (csc.exe missing)"
     } else {
-        $sourceFile = Join-Path $projectRoot "desktop\ScreenMonitorGUI.cs"
+        $desktopDir = Join-Path $projectRoot "desktop"
+        $sourceFile = Join-Path $desktopDir "ScreenMonitorGUI.cs"
         if (-not (Test-Path $sourceFile)) { $sourceFile = Join-Path $projectRoot "ScreenMonitorGUI.cs" }
+        $sourceArg = if (Test-Path $sourceFile) { $sourceFile } else { "/recurse:$desktopDir\*.cs" }
         $iconFile = Join-Path $projectRoot "assets\icons\app_icon.ico"
         if (-not (Test-Path $iconFile)) { $iconFile = Join-Path $projectRoot "app_icon.ico" }
         $manifestFile = Join-Path $projectRoot "desktop\app.manifest"
@@ -50,7 +52,7 @@ if (-not $SkipCSharp) {
             "/win32icon:$iconFile",
             "/win32manifest:$manifestFile",
             "/out:$testExe",
-            $sourceFile
+            $sourceArg
         )
 
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
